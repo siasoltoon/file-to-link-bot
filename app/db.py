@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import DateTime, Integer, String, create_engine, select
@@ -29,8 +29,12 @@ class StoredFile(Base):
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     size_bytes: Mapped[int] = mapped_column(Integer)
     object_key: Mapped[str] = mapped_column(String(1024), unique=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True, index=True)
+
+
+def utcnow() -> datetime:
+    return datetime.utcnow()
 
 
 def init_db() -> None:
@@ -49,10 +53,9 @@ def get_by_token(token: str) -> StoredFile | None:
 
 
 def expired_files(now: datetime | None = None) -> list[StoredFile]:
-    now = now or datetime.now(timezone.utc)
+    now = now or utcnow()
     with Session(engine) as session:
-        rows = list(session.scalars(select(StoredFile).where(StoredFile.expires_at.is_not(None), StoredFile.expires_at <= now)))
-        return rows
+        return list(session.scalars(select(StoredFile).where(StoredFile.expires_at.is_not(None), StoredFile.expires_at <= now)))
 
 
 def delete_record(file_id: int) -> None:
