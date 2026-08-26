@@ -1,14 +1,14 @@
 import asyncio
 import os
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from .config import settings
-from .db import StoredFile, add_file, init_db
+from .db import StoredFile, add_file, init_db, utcnow
 from .storage import storage
 
 MAX_FILE_BYTES = 2_000_000_000
@@ -44,7 +44,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     status = await message.reply_text("⏳ فایل دریافت شد؛ در حال آماده‌سازی لینک مستقیم...")
-    temp_path: str | None = None
 
     try:
         telegram_file = await context.bot.get_file(tg_file.file_id)
@@ -52,7 +51,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         local_path = telegram_file.file_path
         if not local_path or not os.path.isfile(local_path):
             raise RuntimeError("Local Bot API did not return a usable local file path")
-        temp_path = local_path
 
         filename = _safe_filename(getattr(tg_file, "file_name", None))
         token = secrets.token_urlsafe(24)
@@ -61,7 +59,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         await asyncio.to_thread(storage.upload_file, local_path, object_key, content_type)
 
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         is_owner = user.id == settings.owner_telegram_id
         expires_at = None if is_owner else now + timedelta(days=settings.default_file_ttl_days)
 
