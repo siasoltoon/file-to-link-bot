@@ -2,7 +2,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     bot_token: str
     telegram_api_id: int
@@ -20,6 +24,10 @@ class Settings(BaseSettings):
     s3_bucket: str
 
     default_file_ttl_days: int = 30
+    max_file_size_mb: int = 2000
+    cleanup_interval_seconds: int = 3600
+    presigned_url_ttl_seconds: int = 300
+    max_concurrent_uploads: int = 1
     database_url: str = "sqlite:///./data/app.db"
     app_host: str = "0.0.0.0"
     app_port: int = 8000
