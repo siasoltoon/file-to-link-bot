@@ -19,7 +19,9 @@ services:
     depends_on:
       - telegram-bot-api
     volumes:
-      - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+      # Read/write is required so the bot can remove temporary Local Bot API files
+      # after they have been uploaded to object storage.
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
       - app-data:/app/data
 
   web:
