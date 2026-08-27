@@ -55,7 +55,14 @@ def get_by_token(token: str) -> StoredFile | None:
 def expired_files(now: datetime | None = None) -> list[StoredFile]:
     now = now or utcnow()
     with Session(engine) as session:
-        return list(session.scalars(select(StoredFile).where(StoredFile.expires_at.is_not(None), StoredFile.expires_at <= now)))
+        return list(
+            session.scalars(
+                select(StoredFile).where(
+                    StoredFile.expires_at.is_not(None),
+                    StoredFile.expires_at <= now,
+                )
+            )
+        )
 
 
 def delete_record(file_id: int) -> None:
