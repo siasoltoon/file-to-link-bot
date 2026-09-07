@@ -8,17 +8,14 @@ from .config import settings
 
 class Storage:
     def __init__(self) -> None:
+        # Keep Fil.one client settings aligned with the already-working YouTube bot.
         self.client = boto3.client(
             "s3",
             endpoint_url=settings.s3_endpoint_url,
             region_name=settings.s3_region,
             aws_access_key_id=settings.s3_access_key_id,
             aws_secret_access_key=settings.s3_secret_access_key,
-            config=Config(
-                signature_version="s3v4",
-                retries={"max_attempts": 5, "mode": "standard"},
-                s3={"addressing_style": "path"},
-            ),
+            config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "standard"}),
         )
 
     def upload_file(self, local_path: str, object_key: str, content_type: str | None = None) -> None:
@@ -30,11 +27,10 @@ class Storage:
 
     def presigned_download_url(self, object_key: str, filename: str, expires_seconds: int | None = None) -> str:
         expires = expires_seconds or settings.direct_link_expires_seconds
-        # AWS SigV4-compatible S3 services generally cap presigned URLs at 7 days.
         expires = max(60, min(int(expires), 604800))
         safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
         disposition = f"attachment; filename*=UTF-8''{quote(safe_name)}"
-        return self.client.generate_presigned_url(
+        url = self.client.generate_presigned_url(
             "get_object",
             Params={
                 "Bucket": settings.s3_bucket,
@@ -43,10 +39,15 @@ class Storage:
             },
             ExpiresIn=expires,
         )
+        if not url:
+            raise RuntimeError("Fil.one presigned URL generation failed")
+        return url
 
     def healthcheck(self) -> None:
-        # HeadBucket is lightweight and validates endpoint, credentials and bucket access.
-        self.client.head_bucket(Bucket=settings.s3_bucket)
+        # Client construction validates the local configuration shape. Avoid HeadBucket/ListBucket
+        # because S3-compatible providers may deny those permissions even when upload/download works.
+        if not settings.s3_endpoint_url or not settings.s3_bucket:
+            raise RuntimeError("S3 endpoint or bucket is missing")
 
 
 storage = Storage()
