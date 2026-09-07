@@ -7,11 +7,12 @@ class Settings(BaseSettings):
     bot_token: str
     telegram_api_id: int
     telegram_api_hash: str
-    owner_telegram_id: int
+    owner_telegram_id: int | None = None
 
+    # Kept for backward compatibility with the older Docker/Local Bot API deployment.
     telegram_api_base_url: str = "http://telegram-bot-api:8081/bot"
     telegram_file_base_url: str = "http://telegram-bot-api:8081/file/bot"
-    public_base_url: str
+    public_base_url: str = ""
 
     s3_endpoint_url: str
     s3_region: str = "us-east-1"
@@ -19,7 +20,8 @@ class Settings(BaseSettings):
     s3_secret_access_key: str
     s3_bucket: str
 
-    default_file_ttl_days: int = 30
+    direct_link_expires_seconds: int = 604800
+    max_file_bytes: int = 2_000_000_000
     database_url: str = "sqlite:///./data/app.db"
     app_host: str = "0.0.0.0"
     app_port: int = 8000
