@@ -9,6 +9,7 @@ import traceback
 from pathlib import Path
 
 from telethon import TelegramClient, events
+from telethon.sessions import MemorySession
 from telethon.tl import types
 
 from .config import settings
@@ -329,9 +330,27 @@ async def main() -> None:
 
     download_clients = []
     try:
+        # Authenticate the bot exactly once. Reusing this authenticated auth key
+        # avoids ImportBotAuthorizationRequest/FloodWait when creating additional
+        # independent MTProto connections.
+        await client.start(bot_token=settings.bot_token)
+        base_session = client.session
+        if not base_session.auth_key:
+            raise RuntimeError("Main Telegram session has no auth key after bot login")
+
+        print("Telegram bot authorization: ready", flush=True)
+
         for index in range(TELEGRAM_DOWNLOAD_CONNECTIONS):
+            downloader_session = MemorySession()
+            downloader_session.set_dc(
+                base_session.dc_id,
+                base_session.server_address,
+                base_session.port,
+            )
+            downloader_session.auth_key = base_session.auth_key
+
             downloader = TelegramClient(
-                f"file-to-link-bot-download-{index}",
+                downloader_session,
                 settings.telegram_api_id,
                 settings.telegram_api_hash,
                 request_retries=5,
@@ -339,7 +358,11 @@ async def main() -> None:
                 retry_delay=3,
                 auto_reconnect=True,
             )
-            await downloader.start(bot_token=settings.bot_token)
+            await downloader.connect()
+            if not downloader.is_connected():
+                raise RuntimeError(
+                    f"Telegram download connection {index + 1} failed to connect"
+                )
             download_clients.append(downloader)
             print(
                 f"Telegram download connection {index + 1}/{TELEGRAM_DOWNLOAD_CONNECTIONS} ready",
@@ -361,7 +384,6 @@ async def main() -> None:
             if event.message and event.message.media:
                 await _process_media(event, download_clients)
 
-        await client.start(bot_token=settings.bot_token)
         me = await client.get_me()
         print(f"Bot started as @{getattr(me, 'username', None) or me.id}", flush=True)
         print(
@@ -371,11 +393,11 @@ async def main() -> None:
         )
         await client.run_until_disconnected()
     finally:
-        if client.is_connected():
-            await client.disconnect()
         for downloader in download_clients:
             if downloader.is_connected():
                 await downloader.disconnect()
+        if client.is_connected():
+            await client.disconnect()
 
 
 if __name__ == "__main__":
