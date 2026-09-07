@@ -2,6 +2,16 @@ name: Windows Cloud RDP + File To Link Bot
 
 on:
   workflow_dispatch:
+    inputs:
+      connection_count:
+        description: "Independent Telegram MTProto download connections"
+        required: true
+        default: "6"
+        type: choice
+        options:
+          - "4"
+          - "6"
+          - "8"
 
 jobs:
   windows-rdp:
@@ -11,6 +21,7 @@ jobs:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
       TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_DOWNLOAD_CONNECTIONS: ${{ inputs.connection_count }}
       S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
       S3_REGION: eu-west-1
       S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
@@ -104,6 +115,7 @@ jobs:
               if ([string]::IsNullOrWhiteSpace($value)) { throw "Required bot environment variable is missing: $name" }
               Write-Host "OK: $name is configured"
           }
+          Write-Host "Telegram downloader connections: $env:TELEGRAM_DOWNLOAD_CONNECTIONS"
           py -3.13 scripts\healthcheck.py
           if ($LASTEXITCODE -ne 0) { throw "Bot health check failed." }
 
@@ -149,6 +161,7 @@ jobs:
           Write-Host "============================================"
           Write-Host "Windows VM is ready"
           Write-Host "Bot PID: $botPid"
+          Write-Host "Telegram download connections: $env:TELEGRAM_DOWNLOAD_CONNECTIONS"
           Write-Host "Health monitor interval: $monitorIntervalSeconds seconds"
           Write-Host "VM will remain alive for approximately 350 minutes."
           Write-Host "============================================"
