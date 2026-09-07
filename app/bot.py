@@ -3,6 +3,8 @@ import mimetypes
 import os
 import secrets
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from telethon import TelegramClient, events
@@ -11,15 +13,66 @@ from .config import settings
 from .storage import storage
 
 
-def _safe_filename(name: str | None, fallback_ext: str = "") -> str:
-    raw = Path(name or f"file{fallback_ext}").name
+class _ProgressReporter:
+    """Throttle Telegram status edits while supporting callbacks from worker threads."""
+
+    def __init__(self, status_message, loop, total: int, prefix: str) -> None:
+        self.status_message = status_message
+        self.loop = loop
+        self.total = max(int(total or 0), 1)
+        self.prefix = prefix
+        self.seen = 0
+        self.last_update = 0.0
+        self.lock = threading.Lock()
+        self.pending_task = None
+
+    def _schedule(self, current: int) -> None:
+        percent = min(100, int((current / self.total) * 100))
+        text = f"{self.prefix} {percent}% — {_human_size(current)} / {_human_size(self.total)}"
+
+        def create_edit_task() -> None:
+            if self.pending_task is None or self.pending_task.done():
+                self.pending_task = self.loop.create_task(self.status_message.edit(text))
+
+        self.loop.call_soon_threadsafe(create_edit_task)
+
+    def download_callback(self, current: int, total: int) -> None:
+        with self.lock:
+            self.total = max(int(total or self.total), 1)
+            self.seen = int(current)
+            now = time.monotonic()
+            if self.seen < self.total and now - self.last_update < 4:
+                return
+            self.last_update = now
+            current = self.seen
+        self._schedule(current)
+
+    def upload_callback(self, bytes_amount: int) -> None:
+        with self.lock:
+            self.seen += int(bytes_amount)
+            now = time.monotonic()
+            if self.seen < self.total and now - self.last_update < 4:
+                return
+            self.last_update = now
+            current = self.seen
+        self._schedule(current)
+
+
+
+def _safe_filename(
+    name: str | None,
+    fallback_ext: str = "",
+    fallback_stem: str = "telegram_file",
+) -> str:
+    raw = Path(name or f"{fallback_stem}{fallback_ext}").name
     raw = raw.replace("\x00", "_").replace("\r", "_").replace("\n", "_")
-    return (raw[:500] or f"file{fallback_ext}")
+    return (raw[:500] or f"{fallback_stem}{fallback_ext}")
+
 
 
 def _human_size(size: int | None) -> str:
     if not size:
-        return "نامشخص"
+        return "0 B"
     value = float(size)
     for unit in ("B", "KB", "MB", "GB"):
         if value < 1024 or unit == "GB":
@@ -42,18 +95,39 @@ async def _process_media(event) -> None:
         await event.reply("❌ حجم فایل بیشتر از سقف مجاز این ربات است.")
         return
 
-    status = await event.reply("⏳ فایل دریافت شد؛ در حال دانلود و ساخت لینک مستقیم...")
+    status = await event.reply("⏳ فایل دریافت شد؛ در حال آماده‌سازی...")
     temp_path = None
+    loop = asyncio.get_running_loop()
 
     try:
         ext = getattr(tg_file, "ext", None) or ""
-        filename = _safe_filename(getattr(tg_file, "name", None), ext)
-        content_type = getattr(tg_file, "mime_type", None) or mimetypes.guess_type(filename)[0]
+        original_name = getattr(tg_file, "name", None)
+        if not original_name:
+            mime_type = getattr(tg_file, "mime_type", None) or ""
+            guessed_ext = mimetypes.guess_extension(mime_type) or ext or ".bin"
+            if message.raw_text and not message.raw_text.startswith("/"):
+                fallback_stem = _safe_filename(message.raw_text[:80], "").rsplit(".", 1)[0]
+                fallback_stem = fallback_stem or "telegram_file"
+            else:
+                fallback_stem = f"telegram_file_{message.id}"
+            filename = _safe_filename(None, guessed_ext, fallback_stem)
+        else:
+            filename = _safe_filename(original_name, ext)
 
+        content_type = getattr(tg_file, "mime_type", None) or mimetypes.guess_type(filename)[0]
         temp_dir = tempfile.mkdtemp(prefix="file_to_link_")
         temp_path = os.path.join(temp_dir, filename)
 
-        downloaded = await message.download_media(file=temp_path)
+        if size:
+            download_progress = _ProgressReporter(status, loop, size, "⏬ دانلود از تلگرام")
+            downloaded = await message.download_media(
+                file=temp_path,
+                progress_callback=download_progress.download_callback,
+            )
+        else:
+            await status.edit("⏬ در حال دانلود فایل از تلگرام...")
+            downloaded = await message.download_media(file=temp_path)
+
         if not downloaded or not os.path.isfile(downloaded):
             raise RuntimeError("Telegram media download did not produce a local file")
 
@@ -61,10 +135,31 @@ async def _process_media(event) -> None:
         if actual_size > settings.max_file_bytes:
             raise RuntimeError("Downloaded file exceeds configured maximum size")
 
+        await status.edit(
+            "⬆️ فایل دریافت شد؛ در حال آپلود به فضای ابری...\n"
+            f"📁 {filename}\n"
+            f"💾 {_human_size(actual_size)}"
+        )
+
         token = secrets.token_urlsafe(24)
         object_key = f"files/{token}/{filename}"
-        await asyncio.to_thread(storage.upload_file, downloaded, object_key, content_type)
-        link = await asyncio.to_thread(storage.presigned_download_url, object_key, filename)
+        upload_progress = _ProgressReporter(status, loop, actual_size, "⬆️ آپلود به فضای ابری")
+        await asyncio.to_thread(
+            storage.upload_file,
+            downloaded,
+            object_key,
+            content_type,
+            upload_progress.upload_callback,
+        )
+
+        await status.edit("🔗 آپلود کامل شد؛ در حال ساخت لینک دانلود مستقیم...")
+        link = await asyncio.to_thread(
+            storage.presigned_download_url,
+            object_key,
+            filename,
+            None,
+            content_type,
+        )
 
         await status.edit(
             "✅ لینک دانلود مستقیم آماده شد!\n\n"
