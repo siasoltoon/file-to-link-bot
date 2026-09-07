@@ -1,111 +1,129 @@
 import asyncio
+import mimetypes
 import os
 import secrets
-from datetime import timedelta
+import tempfile
 from pathlib import Path
 
-from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telethon import TelegramClient, events
 
 from .config import settings
-from .db import StoredFile, add_file, init_db, utcnow
 from .storage import storage
 
-MAX_FILE_BYTES = 2_000_000_000
+
+def _safe_filename(name: str | None, fallback_ext: str = "") -> str:
+    raw = Path(name or f"file{fallback_ext}").name
+    raw = raw.replace("\x00", "_").replace("\r", "_").replace("\n", "_")
+    return (raw[:500] or f"file{fallback_ext}")
 
 
-def _file_from_message(message):
-    for attr in ("document", "video", "audio", "animation"):
-        value = getattr(message, attr, None)
-        if value is not None:
-            return value
-    return None
+def _human_size(size: int | None) -> str:
+    if not size:
+        return "نامشخص"
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
 
 
-def _safe_filename(name: str | None) -> str:
-    name = name or "file"
-    name = Path(name).name.replace("\x00", "_")
-    return name[:500] or "file"
-
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    user = update.effective_user
-    if not message or not user:
+async def _process_media(event) -> None:
+    message = event.message
+    if not message or not message.media:
         return
 
-    tg_file = _file_from_message(message)
+    tg_file = message.file
     if tg_file is None:
         return
 
-    size = getattr(tg_file, "file_size", None)
-    if size is not None and size > MAX_FILE_BYTES:
-        await message.reply_text("❌ حجم فایل بیشتر از سقف ۲GB است.")
+    size = getattr(tg_file, "size", None)
+    if size is not None and size > settings.max_file_bytes:
+        await event.reply("❌ حجم فایل بیشتر از سقف مجاز این ربات است.")
         return
 
-    status = await message.reply_text("⏳ فایل دریافت شد؛ در حال آماده‌سازی لینک مستقیم...")
+    status = await event.reply("⏳ فایل دریافت شد؛ در حال دانلود و ساخت لینک مستقیم...")
+    temp_path = None
 
     try:
-        telegram_file = await context.bot.get_file(tg_file.file_id)
-        # In Local Bot API mode, getFile returns the absolute local path.
-        local_path = telegram_file.file_path
-        if not local_path or not os.path.isfile(local_path):
-            raise RuntimeError("Local Bot API did not return a usable local file path")
+        ext = getattr(tg_file, "ext", None) or ""
+        filename = _safe_filename(getattr(tg_file, "name", None), ext)
+        content_type = getattr(tg_file, "mime_type", None) or mimetypes.guess_type(filename)[0]
 
-        filename = _safe_filename(getattr(tg_file, "file_name", None))
+        temp_dir = tempfile.mkdtemp(prefix="file_to_link_")
+        temp_path = os.path.join(temp_dir, filename)
+
+        downloaded = await message.download_media(file=temp_path)
+        if not downloaded or not os.path.isfile(downloaded):
+            raise RuntimeError("Telegram media download did not produce a local file")
+
+        actual_size = os.path.getsize(downloaded)
+        if actual_size > settings.max_file_bytes:
+            raise RuntimeError("Downloaded file exceeds configured maximum size")
+
         token = secrets.token_urlsafe(24)
         object_key = f"files/{token}/{filename}"
-        content_type = getattr(tg_file, "mime_type", None)
+        await asyncio.to_thread(storage.upload_file, downloaded, object_key, content_type)
+        link = await asyncio.to_thread(storage.presigned_download_url, object_key, filename)
 
-        await asyncio.to_thread(storage.upload_file, local_path, object_key, content_type)
-
-        now = utcnow()
-        is_owner = user.id == settings.owner_telegram_id
-        expires_at = None if is_owner else now + timedelta(days=settings.default_file_ttl_days)
-
-        record = StoredFile(
-            link_token=token,
-            owner_telegram_id=user.id,
-            filename=filename,
-            content_type=content_type,
-            size_bytes=size or os.path.getsize(local_path),
-            object_key=object_key,
-            created_at=now,
-            expires_at=expires_at,
-        )
-        add_file(record)
-
-        link = f"{settings.public_base_url.rstrip('/')}/d/{token}"
-        lifetime = "♾️ دائمی" if is_owner else f"⏳ {settings.default_file_ttl_days} روز"
-        await status.edit_text(
-            "✅ فایل آماده شد!\n\n"
+        await status.edit(
+            "✅ لینک دانلود مستقیم آماده شد!\n\n"
             f"📁 {filename}\n"
-            f"💾 {record.size_bytes / 1024 / 1024:.1f} MB\n"
-            f"🔗 {link}\n\n"
-            f"اعتبار: {lifetime}"
+            f"💾 {_human_size(actual_size)}\n"
+            f"⏳ اعتبار لینک: {settings.direct_link_expires_seconds // 86400} روز\n\n"
+            f"🔗 {link}"
         )
     except Exception as exc:
-        await status.edit_text("❌ پردازش فایل ناموفق بود. لطفاً دوباره تلاش کنید.")
-        print(f"file processing error: {exc!r}")
+        try:
+            await status.edit("❌ پردازش فایل ناموفق بود. لاگ VPS را بررسی کنید و دوباره تلاش کنید.")
+        except Exception:
+            pass
+        print(f"file processing error: {exc!r}", flush=True)
+    finally:
+        if temp_path:
+            try:
+                parent = Path(temp_path).parent
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                if parent.exists():
+                    parent.rmdir()
+            except OSError:
+                pass
 
 
-def build_application() -> Application:
-    init_db()
-    application = (
-        Application.builder()
-        .token(settings.bot_token)
-        .base_url(settings.telegram_api_base_url)
-        .base_file_url(settings.telegram_file_base_url)
-        .build()
+async def main() -> None:
+    storage.healthcheck()
+
+    client = TelegramClient(
+        "file-to-link-bot",
+        settings.telegram_api_id,
+        settings.telegram_api_hash,
+        request_retries=5,
+        connection_retries=5,
+        retry_delay=3,
+        auto_reconnect=True,
     )
-    application.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.ANIMATION, handle_file))
-    return application
 
+    @client.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
+    async def start_handler(event):
+        await event.reply(
+            "سلام 👋\n"
+            "فایل، ویدیو، صدا یا هر مدیایی را برای من بفرست. "
+            "آن را روی فضای ذخیره‌سازی آپلود می‌کنم و لینک دانلود مستقیم می‌دهم."
+        )
 
-def main() -> None:
-    application = build_application()
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    @client.on(events.NewMessage(incoming=True))
+    async def media_handler(event):
+        if event.raw_text and event.raw_text.startswith("/start"):
+            return
+        if event.message and event.message.media:
+            await _process_media(event)
+
+    await client.start(bot_token=settings.bot_token)
+    me = await client.get_me()
+    print(f"Bot started as @{getattr(me, 'username', None) or me.id}", flush=True)
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
