@@ -122,7 +122,10 @@ async def _download_telegram_file(client, message, destination, file_size, progr
     )
     msg_data = (message.input_chat, message.id) if message.input_chat else None
 
-    return await client._download_file(
+    # Telethon's internal _download_file returns None when writing to a path.
+    # Return the destination explicitly so the caller can reliably validate the
+    # completed local file and continue immediately to the cloud upload stage.
+    await client._download_file(
         location,
         destination,
         part_size_kb=TELEGRAM_DOWNLOAD_PART_SIZE_KB,
@@ -130,6 +133,8 @@ async def _download_telegram_file(client, message, destination, file_size, progr
         progress_callback=progress_callback,
         msg_data=msg_data,
     )
+
+    return destination
 
 
 async def _process_media(event) -> None:
