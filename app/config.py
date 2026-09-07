@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     public_base_url: str = ""
 
     s3_endpoint_url: str
-    s3_region: str = "us-east-1"
+    # Fil.one is already proven to work in the existing YouTube bot with eu-west-1.
+    s3_region: str = "eu-west-1"
     s3_access_key_id: str
     s3_secret_access_key: str
     s3_bucket: str
