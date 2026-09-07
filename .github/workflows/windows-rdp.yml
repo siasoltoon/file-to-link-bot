@@ -7,13 +7,23 @@ jobs:
   windows-rdp:
     runs-on: windows-latest
     timeout-minutes: 360
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+      S3_REGION: eu-west-1
+      S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+      S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      DIRECT_LINK_EXPIRES_SECONDS: 604800
+      MAX_FILE_BYTES: 2000000000
 
     steps:
       - name: 1. Enable Remote Desktop
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-
           Write-Host "Enabling Remote Desktop..."
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
@@ -25,21 +35,18 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $password = "${{ secrets.RDP_PASSWORD }}"
-
           if ([string]::IsNullOrWhiteSpace($password)) {
               throw "RDP_PASSWORD repository secret is missing."
           }
 
           $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
           $existingUser = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
-
           if (-not $existingUser) {
               New-LocalUser -Name "NvDAdmin" -Password $securePassword -PasswordNeverExpires -AccountNeverExpires -Description "Temporary GitHub Actions RDP administrator"
           }
           else {
               Set-LocalUser -Name "NvDAdmin" -Password $securePassword
           }
-
           Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
           Write-Host "RDP administrator created: NvDAdmin"
 
@@ -49,7 +56,6 @@ jobs:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           $ErrorActionPreference = "Stop"
-
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
               throw "TAILSCALE_AUTHKEY repository secret is missing."
           }
@@ -82,9 +88,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $botPath = "C:\file-to-link-bot"
-
           if (Test-Path $botPath) { Remove-Item -Path $botPath -Recurse -Force }
-          git clone --branch feature/windows-vps-direct-link-bot --single-branch "https://github.com/siasoltoon/file-to-link-bot.git" $botPath
+          git clone --branch main --single-branch "https://github.com/siasoltoon/file-to-link-bot.git" $botPath
           Set-Location $botPath
           Write-Host "Bot repository cloned."
           Write-Host "Commit: $(git rev-parse --short HEAD)"
@@ -100,18 +105,6 @@ jobs:
       - name: 6. Validate Bot Configuration
         shell: powershell
         working-directory: C:\file-to-link-bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          OWNER_TELEGRAM_ID: ${{ secrets.OWNER_TELEGRAM_ID }}
-          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
-          S3_REGION: ${{ secrets.S3_REGION }}
-          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          DIRECT_LINK_EXPIRES_SECONDS: 604800
-          MAX_FILE_BYTES: 2000000000
         run: |
           $ErrorActionPreference = "Stop"
           $required = @("BOT_TOKEN","TELEGRAM_API_ID","TELEGRAM_API_HASH","S3_ENDPOINT_URL","S3_ACCESS_KEY_ID","S3_SECRET_ACCESS_KEY","S3_BUCKET")
@@ -120,28 +113,14 @@ jobs:
               if ([string]::IsNullOrWhiteSpace($value)) { throw "Required bot environment variable is missing: $name" }
               Write-Host "OK: $name is configured"
           }
-
           py -3.13 scripts\healthcheck.py
           if ($LASTEXITCODE -ne 0) { throw "Bot health check failed." }
 
       - name: 7. Start File To Link Bot
         shell: powershell
         working-directory: C:\file-to-link-bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          OWNER_TELEGRAM_ID: ${{ secrets.OWNER_TELEGRAM_ID }}
-          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
-          S3_REGION: ${{ secrets.S3_REGION }}
-          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          DIRECT_LINK_EXPIRES_SECONDS: 604800
-          MAX_FILE_BYTES: 2000000000
         run: |
           $ErrorActionPreference = "Stop"
-
           $stdout = "C:\file-to-link-bot\bot.log"
           $stderr = "C:\file-to-link-bot\bot-error.log"
           $pidFile = "C:\file-to-link-bot\bot.pid"
@@ -156,34 +135,19 @@ jobs:
 
           Start-Sleep -Seconds 15
           $process.Refresh()
-
           if ($process.HasExited) {
               Write-Host "Bot exited unexpectedly. Exit code: $($process.ExitCode)"
               if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG ====="; Get-Content $stderr -Tail 120 }
               if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG ====="; Get-Content $stdout -Tail 120 }
               throw "File To Link Bot stopped during startup."
           }
-
           Write-Host "Bot is running successfully."
 
       - name: 8. Keep Windows VM Alive
         shell: powershell
         working-directory: C:\file-to-link-bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          OWNER_TELEGRAM_ID: ${{ secrets.OWNER_TELEGRAM_ID }}
-          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
-          S3_REGION: ${{ secrets.S3_REGION }}
-          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          DIRECT_LINK_EXPIRES_SECONDS: 604800
-          MAX_FILE_BYTES: 2000000000
         run: |
           $ErrorActionPreference = "Stop"
-
           $botPath = "C:\file-to-link-bot"
           $pidFile = "$botPath\bot.pid"
           $stdout = "$botPath\bot.log"
@@ -215,16 +179,15 @@ jobs:
               while ($restartCount -lt 3 -and -not $restarted) {
                   $restartCount++
                   Write-Host "Attempting bot restart $restartCount/3..."
-
                   $python = (& py -3.13 -c "import sys; print(sys.executable)").Trim()
                   if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path $python)) { throw "Could not resolve Python executable for bot restart." }
 
                   $process = Start-Process -FilePath $python -ArgumentList "-u -m app.bot" -WorkingDirectory $botPath -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
                   $botPid = $process.Id
                   $botPid | Out-File -FilePath $pidFile -Encoding ascii
-
                   Start-Sleep -Seconds 15
                   $process.Refresh()
+
                   if (-not $process.HasExited) {
                       Write-Host "Bot restart succeeded. New PID: $botPid"
                       $restarted = $true
@@ -236,9 +199,7 @@ jobs:
                   if ($restartCount -lt 3) { Start-Sleep -Seconds 15 }
               }
 
-              if (-not $restarted) {
-                  throw "Bot could not be kept running after 3 restart attempts."
-              }
+              if (-not $restarted) { throw "Bot could not be kept running after 3 restart attempts." }
           }
 
       - name: 9. Cleanup
@@ -247,7 +208,6 @@ jobs:
         run: |
           Write-Host "Stopping bot before runner shutdown..."
           $pidFile = "C:\file-to-link-bot\bot.pid"
-
           if (Test-Path $pidFile) {
               try {
                   $botPid = [int](Get-Content $pidFile)
@@ -258,5 +218,4 @@ jobs:
                   Write-Host "Bot process was already stopped."
               }
           }
-
           Write-Host "Cleanup completed."
