@@ -16,9 +16,10 @@ from .storage import storage
 
 
 # Telegram upload.getFile allows at most 512 KiB per request.
-# Telethon may choose much smaller chunks for medium-sized files, which creates
-# many more round trips. Use the maximum valid chunk size for this bot's files.
+# Multiple independent MTProto requests can be in flight at once, so we use
+# several 512 KiB streams to hide Telegram/DC round-trip latency.
 TELEGRAM_DOWNLOAD_PART_SIZE_KB = 512
+TELEGRAM_DOWNLOAD_WORKERS = 24
 
 
 class _ProgressReporter:
@@ -99,12 +100,16 @@ def _human_rate(bytes_per_second: float) -> str:
 
 
 async def _download_telegram_file(client, message, destination, file_size, progress_callback):
-    """Download a Telegram document using the largest legal MTProto chunk size.
+    """Download a Telegram document using concurrent maximum-size MTProto chunks.
 
-    We intentionally use Telethon's internal download primitive here because the
-    public ``download_media`` API does not expose ``part_size_kb``. The primitive
-    also accepts ``msg_data``, preserving Telethon's file-reference refresh logic
-    for long-running downloads.
+    Telegram limits each upload.getFile request to 512 KiB. A single sequential
+    stream was limited by network round-trip latency on the VPS route. We split
+    the file into interleaved ranges and keep multiple MTProto requests in flight
+    concurrently, while writing each received chunk to its exact file offset.
+
+    Each worker uses Telethon's internal iterator so file-reference refresh and
+    DC migration handling remain available. The output is still one local file,
+    so the cloud-upload stage is unchanged.
     """
     document = getattr(message, "document", None)
     if not isinstance(document, types.Document):
@@ -122,18 +127,54 @@ async def _download_telegram_file(client, message, destination, file_size, progr
     )
     msg_data = (message.input_chat, message.id) if message.input_chat else None
 
-    # Telethon's internal _download_file returns None when writing to a path.
-    # Return the destination explicitly so the caller can reliably validate the
-    # completed local file and continue immediately to the cloud upload stage.
-    await client._download_file(
-        location,
-        destination,
-        part_size_kb=TELEGRAM_DOWNLOAD_PART_SIZE_KB,
-        file_size=file_size,
-        progress_callback=progress_callback,
-        msg_data=msg_data,
-    )
+    part_size = TELEGRAM_DOWNLOAD_PART_SIZE_KB * 1024
+    worker_count = max(1, min(TELEGRAM_DOWNLOAD_WORKERS, (file_size + part_size - 1) // part_size))
+    stride = worker_count * part_size
+    write_lock = asyncio.Lock()
+    downloaded_total = 0
+    progress_lock = asyncio.Lock()
 
+    # Pre-create the destination so concurrent random-access writes produce the
+    # expected final file even when chunks arrive out of order.
+    with open(destination, "wb") as output:
+        output.truncate(file_size)
+
+    async def worker(worker_index: int) -> None:
+        nonlocal downloaded_total
+        offset = worker_index * part_size
+
+        # No explicit limit is used here. That keeps Telethon on its direct
+        # download iterator path; each worker stops naturally at EOF.
+        iterator = client._iter_download(
+            location,
+            offset=offset,
+            stride=stride,
+            chunk_size=part_size,
+            request_size=part_size,
+            file_size=file_size,
+            msg_data=msg_data,
+        )
+
+        async for chunk in iterator:
+            chunk = bytes(chunk)
+            if not chunk:
+                break
+
+            async with write_lock:
+                with open(destination, "r+b") as output:
+                    output.seek(offset)
+                    output.write(chunk)
+                    output.flush()
+
+            offset += stride
+            async with progress_lock:
+                downloaded_total += len(chunk)
+                current = downloaded_total
+            progress_callback(current, file_size)
+
+        await iterator.close()
+
+    await asyncio.gather(*(worker(i) for i in range(worker_count)))
     return destination
 
 
