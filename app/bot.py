@@ -23,12 +23,19 @@ class _ProgressReporter:
         self.prefix = prefix
         self.seen = 0
         self.last_update = 0.0
+        self.started_at = time.monotonic()
         self.lock = threading.Lock()
         self.pending_task = None
 
     def _schedule(self, current: int) -> None:
         percent = min(100, int((current / self.total) * 100))
-        text = f"{self.prefix} {percent}% — {_human_size(current)} / {_human_size(self.total)}"
+        elapsed = max(time.monotonic() - self.started_at, 0.001)
+        rate = current / elapsed
+        text = (
+            f"{self.prefix} {percent}% — {_human_size(current)} / "
+            f"{_human_size(self.total)}\n"
+            f"🚀 سرعت میانگین: {_human_rate(rate)}"
+        )
 
         def create_edit_task() -> None:
             if self.pending_task is None or self.pending_task.done():
@@ -81,6 +88,11 @@ def _human_size(size: int | None) -> str:
     return f"{size} B"
 
 
+
+def _human_rate(bytes_per_second: float) -> str:
+    return f"{_human_size(bytes_per_second)}/s"
+
+
 async def _process_media(event) -> None:
     message = event.message
     if not message or not message.media:
@@ -123,10 +135,14 @@ async def _process_media(event) -> None:
             downloaded = await message.download_media(
                 file=temp_path,
                 progress_callback=download_progress.download_callback,
+                part_size_kb=512,
             )
         else:
             await status.edit("⏬ در حال دانلود فایل از تلگرام...")
-            downloaded = await message.download_media(file=temp_path)
+            downloaded = await message.download_media(
+                file=temp_path,
+                part_size_kb=512,
+            )
 
         if not downloaded or not os.path.isfile(downloaded):
             raise RuntimeError("Telegram media download did not produce a local file")
@@ -188,6 +204,12 @@ async def _process_media(event) -> None:
 
 async def main() -> None:
     storage.healthcheck()
+
+    try:
+        import cryptg  # noqa: F401
+        print("Telethon crypto acceleration: cryptg enabled", flush=True)
+    except ImportError:
+        print("WARNING: cryptg is not installed; Telethon will use slower pure-Python crypto", flush=True)
 
     client = TelegramClient(
         "file-to-link-bot",
