@@ -38,13 +38,11 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($password)) {
               throw "RDP_PASSWORD repository secret is missing."
           }
-
           $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
           $existingUser = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
           if (-not $existingUser) {
               New-LocalUser -Name "NvDAdmin" -Password $securePassword -PasswordNeverExpires -AccountNeverExpires -Description "Temporary GitHub Actions RDP administrator"
-          }
-          else {
+          } else {
               Set-LocalUser -Name "NvDAdmin" -Password $securePassword
           }
           Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
@@ -56,25 +54,18 @@ jobs:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-              throw "TAILSCALE_AUTHKEY repository secret is missing."
-          }
-
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) { throw "TAILSCALE_AUTHKEY repository secret is missing." }
           $installer = "$env:TEMP\tailscale-setup.msi"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installer
           Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait -NoNewWindow
-
           $tailscale = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
           if (-not (Test-Path $tailscale)) { $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe" }
           if (-not (Test-Path $tailscale)) { throw "Tailscale executable was not found after installation." }
-
           & $tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="github-file-link-server"
           if ($LASTEXITCODE -ne 0) { throw "Tailscale connection failed." }
-
           Start-Sleep -Seconds 5
           $ip = & $tailscale ip -4
           if ([string]::IsNullOrWhiteSpace($ip)) { throw "Could not obtain Tailscale IPv4 address." }
-
           Write-Host "============================================"
           Write-Host "Tailscale RDP Server"
           Write-Host "============================================"
@@ -124,21 +115,18 @@ jobs:
           $stdout = "C:\file-to-link-bot\bot.log"
           $stderr = "C:\file-to-link-bot\bot-error.log"
           $pidFile = "C:\file-to-link-bot\bot.pid"
-          Remove-Item $stdout,$stderr -Force -ErrorAction SilentlyContinue
-
+          Remove-Item $stdout,$stderr,$pidFile -Force -ErrorAction SilentlyContinue
           $python = (& py -3.13 -c "import sys; print(sys.executable)").Trim()
           if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path $python)) { throw "Could not resolve the Python 3.13 executable." }
-
           $process = Start-Process -FilePath $python -ArgumentList "-u -m app.bot" -WorkingDirectory "C:\file-to-link-bot" -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
           $process.Id | Out-File -FilePath $pidFile -Encoding ascii
           Write-Host "Bot PID: $($process.Id)"
-
-          Start-Sleep -Seconds 15
+          Start-Sleep -Seconds 20
           $process.Refresh()
           if ($process.HasExited) {
               Write-Host "Bot exited unexpectedly. Exit code: $($process.ExitCode)"
-              if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG ====="; Get-Content $stderr -Tail 120 }
-              if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG ====="; Get-Content $stdout -Tail 120 }
+              if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG ====="; Get-Content $stderr -Tail 200 }
+              if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG ====="; Get-Content $stdout -Tail 200 }
               throw "File To Link Bot stopped during startup."
           }
           Write-Host "Bot is running successfully."
@@ -152,55 +140,65 @@ jobs:
           $pidFile = "$botPath\bot.pid"
           $stdout = "$botPath\bot.log"
           $stderr = "$botPath\bot-error.log"
-
+          $monitorIntervalSeconds = 10
+          $restartAttempts = 3
           if (-not (Test-Path $pidFile)) { throw "Bot PID file was not found." }
           $botPid = [int](Get-Content $pidFile)
-
+          $startedAt = Get-Date
+          $lastHeartbeatMinute = -1
           Write-Host "============================================"
           Write-Host "Windows VM is ready"
           Write-Host "Bot PID: $botPid"
+          Write-Host "Health monitor interval: $monitorIntervalSeconds seconds"
           Write-Host "VM will remain alive for approximately 350 minutes."
           Write-Host "============================================"
-
-          for ($minute = 0; $minute -lt 350; $minute += 5) {
-              Start-Sleep -Seconds 300
+          $deadline = $startedAt.AddMinutes(350)
+          while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds $monitorIntervalSeconds
               $process = Get-Process -Id $botPid -ErrorAction SilentlyContinue
               if ($process) {
-                  Write-Host "[$minute minutes] VM alive | Bot PID $botPid running"
+                  $elapsedMinutes = [int]((New-TimeSpan -Start $startedAt -End (Get-Date)).TotalMinutes)
+                  if ($elapsedMinutes -ne $lastHeartbeatMinute) {
+                      Write-Host "[$elapsedMinutes minutes] VM alive | Bot PID $botPid running"
+                      $lastHeartbeatMinute = $elapsedMinutes
+                  }
                   continue
               }
-
-              Write-Host "Bot process has stopped. Collecting diagnostics..."
-              if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG ====="; Get-Content $stderr -Tail 150 }
-              if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG ====="; Get-Content $stdout -Tail 150 }
-
-              $restartCount = 0
+              Write-Host "============================================"
+              Write-Host "BOT CRASH DETECTED"
+              Write-Host "Previous PID: $botPid"
+              Write-Host "Time: $(Get-Date -Format o)"
+              Write-Host "============================================"
+              if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG BEFORE RESTART ====="; Get-Content $stderr -Tail 250 }
+              if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG BEFORE RESTART ====="; Get-Content $stdout -Tail 250 }
               $restarted = $false
-              while ($restartCount -lt 3 -and -not $restarted) {
-                  $restartCount++
-                  Write-Host "Attempting bot restart $restartCount/3..."
+              for ($attempt = 1; $attempt -le $restartAttempts; $attempt++) {
+                  Write-Host "Attempting bot restart $attempt/$restartAttempts..."
+                  Remove-Item $stdout,$stderr -Force -ErrorAction SilentlyContinue
                   $python = (& py -3.13 -c "import sys; print(sys.executable)").Trim()
                   if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path $python)) { throw "Could not resolve Python executable for bot restart." }
-
                   $process = Start-Process -FilePath $python -ArgumentList "-u -m app.bot" -WorkingDirectory $botPath -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
                   $botPid = $process.Id
                   $botPid | Out-File -FilePath $pidFile -Encoding ascii
-                  Start-Sleep -Seconds 15
+                  Write-Host "New bot PID: $botPid"
+                  Start-Sleep -Seconds 20
                   $process.Refresh()
-
                   if (-not $process.HasExited) {
                       Write-Host "Bot restart succeeded. New PID: $botPid"
                       $restarted = $true
                       break
                   }
-
                   Write-Host "Restarted bot exited. Exit code: $($process.ExitCode)"
-                  if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG AFTER RESTART ====="; Get-Content $stderr -Tail 150 }
-                  if ($restartCount -lt 3) { Start-Sleep -Seconds 15 }
+                  if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG AFTER RESTART ====="; Get-Content $stderr -Tail 250 }
+                  if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG AFTER RESTART ====="; Get-Content $stdout -Tail 250 }
+                  if ($attempt -lt $restartAttempts) { Start-Sleep -Seconds 5 }
               }
-
-              if (-not $restarted) { throw "Bot could not be kept running after 3 restart attempts." }
+              if (-not $restarted) { throw "Bot could not be kept running after $restartAttempts restart attempts." }
+              $startedAt = Get-Date
+              $lastHeartbeatMinute = -1
+              Write-Host "Bot monitoring resumed immediately after successful restart."
           }
+          Write-Host "350-minute VM lifetime reached. Keep Alive finished normally."
 
       - name: 9. Cleanup
         if: always()
