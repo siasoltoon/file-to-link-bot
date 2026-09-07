@@ -2,6 +2,6 @@ boto3>=1.40,<2
 fastapi>=0.116,<1
 pydantic-settings>=2.10,<3
 SQLAlchemy>=2.0,<3
-Telethon>=1.40,<2
+Telethon>=1.40,<1.41
 cryptg>=0.5,<1
 uvicorn[standard]>=0.35,<1
