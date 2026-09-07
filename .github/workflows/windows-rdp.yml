@@ -46,9 +46,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $password = "${{ secrets.RDP_PASSWORD }}"
-          if ([string]::IsNullOrWhiteSpace($password)) {
-              throw "RDP_PASSWORD repository secret is missing."
-          }
+          if ([string]::IsNullOrWhiteSpace($password)) { throw "RDP_PASSWORD repository secret is missing." }
           $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
           $existingUser = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
           if (-not $existingUser) {
@@ -96,7 +94,13 @@ jobs:
           Write-Host "Bot repository cloned."
           Write-Host "Commit: $(git rev-parse --short HEAD)"
 
-      - name: 5. Bootstrap Windows Bot Environment
+      - name: 5. Restore Persistent Telegram Session
+        uses: actions/cache@v4
+        with:
+          path: C:\file-to-link-bot\file-to-link-bot.session
+          key: file-to-link-bot-telegram-session-v1
+
+      - name: 6. Bootstrap Windows Bot Environment
         shell: powershell
         working-directory: C:\file-to-link-bot
         run: |
@@ -104,7 +108,7 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\setup_windows.ps1"
           if ($LASTEXITCODE -ne 0) { throw "Windows bootstrap failed." }
 
-      - name: 6. Validate Bot Configuration
+      - name: 7. Validate Bot Configuration
         shell: powershell
         working-directory: C:\file-to-link-bot
         run: |
@@ -116,10 +120,17 @@ jobs:
               Write-Host "OK: $name is configured"
           }
           Write-Host "Telegram downloader connections: $env:TELEGRAM_DOWNLOAD_CONNECTIONS"
+          if (Test-Path "C:\file-to-link-bot\file-to-link-bot.session") {
+              Write-Host "Persistent Telegram session: restored"
+              "TELEGRAM_SESSION_RESTORED=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+              Write-Host "Persistent Telegram session: not found; first authorization may be rate-limited"
+              "TELEGRAM_SESSION_RESTORED=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
           py -3.13 scripts\healthcheck.py
           if ($LASTEXITCODE -ne 0) { throw "Bot health check failed." }
 
-      - name: 7. Start File To Link Bot
+      - name: 8. Start File To Link Bot
         shell: powershell
         working-directory: C:\file-to-link-bot
         run: |
@@ -127,23 +138,47 @@ jobs:
           $stdout = "C:\file-to-link-bot\bot.log"
           $stderr = "C:\file-to-link-bot\bot-error.log"
           $pidFile = "C:\file-to-link-bot\bot.pid"
-          Remove-Item $stdout,$stderr,$pidFile -Force -ErrorAction SilentlyContinue
-          $python = (& py -3.13 -c "import sys; print(sys.executable)").Trim()
-          if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path $python)) { throw "Could not resolve the Python 3.13 executable." }
-          $process = Start-Process -FilePath $python -ArgumentList "-u -m app.bot" -WorkingDirectory "C:\file-to-link-bot" -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
-          $process.Id | Out-File -FilePath $pidFile -Encoding ascii
-          Write-Host "Bot PID: $($process.Id)"
-          Start-Sleep -Seconds 20
-          $process.Refresh()
-          if ($process.HasExited) {
-              Write-Host "Bot exited unexpectedly. Exit code: $($process.ExitCode)"
-              if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG ====="; Get-Content $stderr -Tail 200 }
-              if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG ====="; Get-Content $stdout -Tail 200 }
-              throw "File To Link Bot stopped during startup."
-          }
-          Write-Host "Bot is running successfully."
+          $maxFloodWaitRetries = 2
+          $started = $false
 
-      - name: 8. Keep Windows VM Alive
+          for ($attempt = 1; $attempt -le ($maxFloodWaitRetries + 1); $attempt++) {
+              Remove-Item $stdout,$stderr,$pidFile -Force -ErrorAction SilentlyContinue
+              $python = (& py -3.13 -c "import sys; print(sys.executable)").Trim()
+              if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path $python)) { throw "Could not resolve the Python 3.13 executable." }
+
+              Write-Host "Starting File To Link Bot (attempt $attempt)..."
+              $process = Start-Process -FilePath $python -ArgumentList "-u -m app.bot" -WorkingDirectory "C:\file-to-link-bot" -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+              $process.Id | Out-File -FilePath $pidFile -Encoding ascii
+              Write-Host "Bot PID: $($process.Id)"
+              Start-Sleep -Seconds 20
+              $process.Refresh()
+
+              if (-not $process.HasExited) {
+                  Write-Host "Bot is running successfully."
+                  $started = $true
+                  break
+              }
+
+              $errorText = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { "" }
+              if ($errorText -match "A wait of (\d+) seconds is required.*ImportBotAuthorizationRequest") {
+                  $waitSeconds = [int]$Matches[1]
+                  if ($attempt -le $maxFloodWaitRetries) {
+                      Write-Host "Telegram authorization is rate-limited. Waiting $waitSeconds seconds before retrying."
+                      if ($waitSeconds -gt 3300) { throw "Telegram authorization FloodWait is too long: $waitSeconds seconds." }
+                      Start-Sleep -Seconds ($waitSeconds + 5)
+                      continue
+                  }
+              }
+
+              Write-Host "Bot exited unexpectedly. Exit code: $($process.ExitCode)"
+              if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG ====="; Get-Content $stderr -Tail 250 }
+              if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG ====="; Get-Content $stdout -Tail 250 }
+              break
+          }
+
+          if (-not $started) { throw "File To Link Bot stopped during startup." }
+
+      - name: 9. Keep Windows VM Alive
         shell: powershell
         working-directory: C:\file-to-link-bot
         run: |
@@ -158,14 +193,16 @@ jobs:
           $botPid = [int](Get-Content $pidFile)
           $startedAt = Get-Date
           $lastHeartbeatMinute = -1
+          $keepAliveMinutes = if ($env:TELEGRAM_SESSION_RESTORED -eq "1") { 350 } else { 300 }
           Write-Host "============================================"
           Write-Host "Windows VM is ready"
           Write-Host "Bot PID: $botPid"
           Write-Host "Telegram download connections: $env:TELEGRAM_DOWNLOAD_CONNECTIONS"
+          Write-Host "Persistent Telegram session restored: $env:TELEGRAM_SESSION_RESTORED"
           Write-Host "Health monitor interval: $monitorIntervalSeconds seconds"
-          Write-Host "VM will remain alive for approximately 350 minutes."
+          Write-Host "VM will remain alive for approximately $keepAliveMinutes minutes."
           Write-Host "============================================"
-          $deadline = $startedAt.AddMinutes(350)
+          $deadline = $startedAt.AddMinutes($keepAliveMinutes)
           while ((Get-Date) -lt $deadline) {
               Start-Sleep -Seconds $monitorIntervalSeconds
               $process = Get-Process -Id $botPid -ErrorAction SilentlyContinue
@@ -211,9 +248,9 @@ jobs:
               $lastHeartbeatMinute = -1
               Write-Host "Bot monitoring resumed immediately after successful restart."
           }
-          Write-Host "350-minute VM lifetime reached. Keep Alive finished normally."
+          Write-Host "$keepAliveMinutes-minute VM lifetime reached. Keep Alive finished normally."
 
-      - name: 9. Cleanup
+      - name: 10. Cleanup
         if: always()
         shell: powershell
         run: |
