@@ -17,12 +17,16 @@ from .storage import storage
 
 
 # Telegram upload.getFile allows at most 512 KiB per request.
-# One MTProto connection can still be constrained by the Telegram/DC route, so
-# the downloader uses several independent authenticated MTProto connections.
-# Each connection downloads a different interleaved range of the same file.
+# We keep a small pool of authenticated MTProto connections, but run more
+# download iterators concurrently so several 512 KiB requests are in flight
+# at the same time. This is substantially more efficient than many requests
+# serialized through a single iterator while keeping the auth/session count low.
 TELEGRAM_DOWNLOAD_PART_SIZE_KB = 512
 TELEGRAM_DOWNLOAD_CONNECTIONS = max(
     1, min(int(os.getenv("TELEGRAM_DOWNLOAD_CONNECTIONS", "4")), 8)
+)
+TELEGRAM_DOWNLOAD_WORKERS = max(
+    1, min(int(os.getenv("TELEGRAM_DOWNLOAD_WORKERS", "16")), 32)
 )
 
 
@@ -110,17 +114,9 @@ async def _download_telegram_file(
     file_size,
     progress_callback,
 ):
-    """Download a Telegram document over independent MTProto connections.
-
-    Telegram limits each upload.getFile request to 512 KiB. Independent
-    authenticated MTProto connections are used instead of many concurrent
-    requests on one connection. Each connection owns one interleaved range.
-    The connection count is configurable from TELEGRAM_DOWNLOAD_CONNECTIONS
-    and is capped at eight to avoid creating unnecessary MTProto sessions.
-    """
+    """Download a Telegram document using concurrent 512 KiB MTProto requests."""
     document = getattr(message, "document", None)
     if not isinstance(document, types.Document):
-        # Keep the normal Telethon path for media types that are not documents.
         return await message.download_media(
             file=destination,
             progress_callback=progress_callback,
@@ -135,19 +131,18 @@ async def _download_telegram_file(
     msg_data = (message.input_chat, message.id) if message.input_chat else None
 
     part_size = TELEGRAM_DOWNLOAD_PART_SIZE_KB * 1024
-    connection_count = max(
+    worker_count = max(
         1,
         min(
-            TELEGRAM_DOWNLOAD_CONNECTIONS,
+            TELEGRAM_DOWNLOAD_WORKERS,
             (file_size + part_size - 1) // part_size,
         ),
     )
-    stride = connection_count * part_size
+    connection_count = max(1, min(len(download_clients), TELEGRAM_DOWNLOAD_CONNECTIONS))
+    stride = worker_count * part_size
     downloaded_total = 0
     progress_lock = asyncio.Lock()
 
-    # Pre-create the destination so concurrent random-access writes produce the
-    # expected final file even when chunks arrive out of order.
     with open(destination, "wb") as output:
         output.truncate(file_size)
 
@@ -165,36 +160,36 @@ async def _download_telegram_file(
             msg_data=msg_data,
         )
 
-        try:
-            async for chunk in iterator:
-                chunk = bytes(chunk)
-                if not chunk:
-                    break
+        # Keep one file handle per worker instead of opening/closing the file for
+        # every 512 KiB chunk. This removes thousands of Windows file operations
+        # during a large download.
+        with open(destination, "r+b", buffering=0) as output:
+            try:
+                async for chunk in iterator:
+                    chunk = bytes(chunk)
+                    if not chunk:
+                        break
 
-                # Each worker writes to a distinct offset. The synchronous file
-                # operation is small and avoids a separate thread per chunk.
-                with open(destination, "r+b") as output:
                     output.seek(offset)
                     output.write(chunk)
+                    offset += stride
 
-                offset += stride
-                async with progress_lock:
-                    downloaded_total += len(chunk)
-                    current = downloaded_total
-                progress_callback(current, file_size)
-        finally:
-            await iterator.close()
+                    async with progress_lock:
+                        downloaded_total += len(chunk)
+                        current = downloaded_total
+                    progress_callback(current, file_size)
+            finally:
+                await iterator.close()
 
     clients = list(download_clients[:connection_count])
-    if len(clients) != connection_count:
-        raise RuntimeError(
-            f"Not enough Telegram download connections: "
-            f"need {connection_count}, have {len(clients)}"
-        )
+    if not clients:
+        raise RuntimeError("No Telegram download connections are available")
 
-    await asyncio.gather(
-        *(worker(index, client) for index, client in enumerate(clients))
-    )
+    tasks = [
+        worker(index, clients[index % connection_count])
+        for index in range(worker_count)
+    ]
+    await asyncio.gather(*tasks)
     return destination
 
 
@@ -330,9 +325,6 @@ async def main() -> None:
 
     download_clients = []
     try:
-        # Authenticate the bot exactly once. Reusing this authenticated auth key
-        # avoids ImportBotAuthorizationRequest/FloodWait when creating additional
-        # independent MTProto connections.
         await client.start(bot_token=settings.bot_token)
         base_session = client.session
         if not base_session.auth_key:
@@ -387,8 +379,9 @@ async def main() -> None:
         me = await client.get_me()
         print(f"Bot started as @{getattr(me, 'username', None) or me.id}", flush=True)
         print(
-            f"Telegram downloader: {TELEGRAM_DOWNLOAD_CONNECTIONS} independent MTProto connections "
-            f"× {TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB",
+            f"Telegram downloader: {TELEGRAM_DOWNLOAD_CONNECTIONS} MTProto connections × "
+            f"{TELEGRAM_DOWNLOAD_WORKERS} concurrent download workers × "
+            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests",
             flush=True,
         )
         await client.run_until_disconnected()
