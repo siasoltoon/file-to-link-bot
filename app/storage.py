@@ -1,4 +1,4 @@
-from urllib.parse import quote
+from pathlib import Path
 
 import boto3
 from botocore.config import Config
@@ -19,7 +19,11 @@ class Storage:
         )
 
     def upload_file(self, local_path: str, object_key: str, content_type: str | None = None) -> None:
-        extra_args = {"ContentType": content_type} if content_type else None
+        filename = Path(local_path).name.replace('"', "").replace("\r", "").replace("\n", "")
+        extra_args = {
+            "ContentType": content_type or "application/octet-stream",
+            "ContentDisposition": f'attachment; filename="{filename}"',
+        }
         self.client.upload_file(local_path, settings.s3_bucket, object_key, ExtraArgs=extra_args)
 
     def delete_file(self, object_key: str) -> None:
@@ -28,15 +32,10 @@ class Storage:
     def presigned_download_url(self, object_key: str, filename: str, expires_seconds: int | None = None) -> str:
         expires = expires_seconds or settings.direct_link_expires_seconds
         expires = max(60, min(int(expires), 604800))
-        safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
-        disposition = f"attachment; filename*=UTF-8''{quote(safe_name)}"
+        # Fil.one is already proven to accept this exact presigned GET pattern.
         url = self.client.generate_presigned_url(
             "get_object",
-            Params={
-                "Bucket": settings.s3_bucket,
-                "Key": object_key,
-                "ResponseContentDisposition": disposition,
-            },
+            Params={"Bucket": settings.s3_bucket, "Key": object_key},
             ExpiresIn=expires,
         )
         if not url:
@@ -44,8 +43,8 @@ class Storage:
         return url
 
     def healthcheck(self) -> None:
-        # Client construction validates the local configuration shape. Avoid HeadBucket/ListBucket
-        # because S3-compatible providers may deny those permissions even when upload/download works.
+        # Avoid HeadBucket/ListBucket because compatible providers may deny those permissions
+        # even when upload and signed downloads work correctly.
         if not settings.s3_endpoint_url or not settings.s3_bucket:
             raise RuntimeError("S3 endpoint or bucket is missing")
 
