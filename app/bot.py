@@ -20,7 +20,9 @@ from .storage import storage
 # the downloader uses several independent authenticated MTProto connections.
 # Each connection downloads a different interleaved range of the same file.
 TELEGRAM_DOWNLOAD_PART_SIZE_KB = 512
-TELEGRAM_DOWNLOAD_CONNECTIONS = 4
+TELEGRAM_DOWNLOAD_CONNECTIONS = max(
+    1, min(int(os.getenv("TELEGRAM_DOWNLOAD_CONNECTIONS", "4")), 8)
+)
 
 
 class _ProgressReporter:
@@ -109,18 +111,11 @@ async def _download_telegram_file(
 ):
     """Download a Telegram document over independent MTProto connections.
 
-    Telegram limits each upload.getFile request to 512 KiB. Four independent
-    authenticated MTProto connections are used here instead of many concurrent
-    requests on one connection. Each connection owns one interleaved range:
-
-        connection 0: 0, 4*part, 8*part, ...
-        connection 1: 1*part, 5*part, 9*part, ...
-        connection 2: 2*part, 6*part, 10*part, ...
-        connection 3: 3*part, 7*part, 11*part, ...
-
-    This is intentionally different from merely increasing asyncio workers on
-    the same Telethon connection, which was tested and did not materially raise
-    Telegram -> VPS throughput.
+    Telegram limits each upload.getFile request to 512 KiB. Independent
+    authenticated MTProto connections are used instead of many concurrent
+    requests on one connection. Each connection owns one interleaved range.
+    The connection count is configurable from TELEGRAM_DOWNLOAD_CONNECTIONS
+    and is capped at eight to avoid creating unnecessary MTProto sessions.
     """
     document = getattr(message, "document", None)
     if not isinstance(document, types.Document):
