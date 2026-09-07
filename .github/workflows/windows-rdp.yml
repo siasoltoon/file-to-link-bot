@@ -6,7 +6,7 @@ on:
       connection_count:
         description: "Independent Telegram MTProto download connections"
         required: true
-        default: "6"
+        default: "4"
         type: choice
         options:
           - "4"
