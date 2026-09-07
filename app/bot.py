@@ -5,6 +5,7 @@ import secrets
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from telethon import TelegramClient, events
@@ -65,7 +66,6 @@ class _ProgressReporter:
         self._schedule(current)
 
 
-
 def _safe_filename(
     name: str | None,
     fallback_ext: str = "",
@@ -74,7 +74,6 @@ def _safe_filename(
     raw = Path(name or f"{fallback_stem}{fallback_ext}").name
     raw = raw.replace("\x00", "_").replace("\r", "_").replace("\n", "_")
     return (raw[:500] or f"{fallback_stem}{fallback_ext}")
-
 
 
 def _human_size(size: int | None) -> str:
@@ -86,7 +85,6 @@ def _human_size(size: int | None) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{size} B"
-
 
 
 def _human_rate(bytes_per_second: float) -> str:
@@ -135,13 +133,11 @@ async def _process_media(event) -> None:
             downloaded = await message.download_media(
                 file=temp_path,
                 progress_callback=download_progress.download_callback,
-                part_size_kb=512,
             )
         else:
             await status.edit("⏬ در حال دانلود فایل از تلگرام...")
             downloaded = await message.download_media(
                 file=temp_path,
-                part_size_kb=512,
             )
 
         if not downloaded or not os.path.isfile(downloaded):
@@ -185,11 +181,12 @@ async def _process_media(event) -> None:
             f"🔗 {link}"
         )
     except Exception as exc:
+        print(f"file processing error: {exc!r}", flush=True)
+        print(traceback.format_exc(), flush=True)
         try:
             await status.edit("❌ پردازش فایل ناموفق بود. لاگ VPS را بررسی کنید و دوباره تلاش کنید.")
         except Exception:
             pass
-        print(f"file processing error: {exc!r}", flush=True)
     finally:
         if temp_path:
             try:
