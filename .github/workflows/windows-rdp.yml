@@ -1,0 +1,262 @@
+name: Windows Cloud RDP + File To Link Bot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Enable Remote Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Enabling Remote Desktop..."
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+          Write-Host "Remote Desktop enabled."
+
+      - name: 2. Create Temporary RDP Administrator
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $password = "${{ secrets.RDP_PASSWORD }}"
+
+          if ([string]::IsNullOrWhiteSpace($password)) {
+              throw "RDP_PASSWORD repository secret is missing."
+          }
+
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          $existingUser = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
+
+          if (-not $existingUser) {
+              New-LocalUser -Name "NvDAdmin" -Password $securePassword -PasswordNeverExpires -AccountNeverExpires -Description "Temporary GitHub Actions RDP administrator"
+          }
+          else {
+              Set-LocalUser -Name "NvDAdmin" -Password $securePassword
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
+          Write-Host "RDP administrator created: NvDAdmin"
+
+      - name: 3. Install and Configure Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw "TAILSCALE_AUTHKEY repository secret is missing."
+          }
+
+          $installer = "$env:TEMP\tailscale-setup.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait -NoNewWindow
+
+          $tailscale = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) { $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe" }
+          if (-not (Test-Path $tailscale)) { throw "Tailscale executable was not found after installation." }
+
+          & $tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="github-file-link-server"
+          if ($LASTEXITCODE -ne 0) { throw "Tailscale connection failed." }
+
+          Start-Sleep -Seconds 5
+          $ip = & $tailscale ip -4
+          if ([string]::IsNullOrWhiteSpace($ip)) { throw "Could not obtain Tailscale IPv4 address." }
+
+          Write-Host "============================================"
+          Write-Host "Tailscale RDP Server"
+          Write-Host "============================================"
+          Write-Host "IP Address : $ip"
+          Write-Host "Username   : NvDAdmin"
+          Write-Host "RDP password is stored in GitHub Secrets."
+          Write-Host "============================================"
+
+      - name: 4. Clone File To Link Bot
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $botPath = "C:\file-to-link-bot"
+
+          if (Test-Path $botPath) { Remove-Item -Path $botPath -Recurse -Force }
+          git clone --branch feature/windows-vps-direct-link-bot --single-branch "https://github.com/siasoltoon/file-to-link-bot.git" $botPath
+          Set-Location $botPath
+          Write-Host "Bot repository cloned."
+          Write-Host "Commit: $(git rev-parse --short HEAD)"
+
+      - name: 5. Bootstrap Windows Bot Environment
+        shell: powershell
+        working-directory: C:\file-to-link-bot
+        run: |
+          $ErrorActionPreference = "Stop"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\setup_windows.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "Windows bootstrap failed." }
+
+      - name: 6. Validate Bot Configuration
+        shell: powershell
+        working-directory: C:\file-to-link-bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          OWNER_TELEGRAM_ID: ${{ secrets.OWNER_TELEGRAM_ID }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          DIRECT_LINK_EXPIRES_SECONDS: 604800
+          MAX_FILE_BYTES: 2000000000
+        run: |
+          $ErrorActionPreference = "Stop"
+          $required = @("BOT_TOKEN","TELEGRAM_API_ID","TELEGRAM_API_HASH","S3_ENDPOINT_URL","S3_ACCESS_KEY_ID","S3_SECRET_ACCESS_KEY","S3_BUCKET")
+          foreach ($name in $required) {
+              $value = [Environment]::GetEnvironmentVariable($name)
+              if ([string]::IsNullOrWhiteSpace($value)) { throw "Required bot environment variable is missing: $name" }
+              Write-Host "OK: $name is configured"
+          }
+
+          py -3.13 scripts\healthcheck.py
+          if ($LASTEXITCODE -ne 0) { throw "Bot health check failed." }
+
+      - name: 7. Start File To Link Bot
+        shell: powershell
+        working-directory: C:\file-to-link-bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          OWNER_TELEGRAM_ID: ${{ secrets.OWNER_TELEGRAM_ID }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          DIRECT_LINK_EXPIRES_SECONDS: 604800
+          MAX_FILE_BYTES: 2000000000
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $stdout = "C:\file-to-link-bot\bot.log"
+          $stderr = "C:\file-to-link-bot\bot-error.log"
+          $pidFile = "C:\file-to-link-bot\bot.pid"
+          Remove-Item $stdout,$stderr -Force -ErrorAction SilentlyContinue
+
+          $python = (& py -3.13 -c "import sys; print(sys.executable)").Trim()
+          if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path $python)) { throw "Could not resolve the Python 3.13 executable." }
+
+          $process = Start-Process -FilePath $python -ArgumentList "-u -m app.bot" -WorkingDirectory "C:\file-to-link-bot" -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          $process.Id | Out-File -FilePath $pidFile -Encoding ascii
+          Write-Host "Bot PID: $($process.Id)"
+
+          Start-Sleep -Seconds 15
+          $process.Refresh()
+
+          if ($process.HasExited) {
+              Write-Host "Bot exited unexpectedly. Exit code: $($process.ExitCode)"
+              if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG ====="; Get-Content $stderr -Tail 120 }
+              if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG ====="; Get-Content $stdout -Tail 120 }
+              throw "File To Link Bot stopped during startup."
+          }
+
+          Write-Host "Bot is running successfully."
+
+      - name: 8. Keep Windows VM Alive
+        shell: powershell
+        working-directory: C:\file-to-link-bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          OWNER_TELEGRAM_ID: ${{ secrets.OWNER_TELEGRAM_ID }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          DIRECT_LINK_EXPIRES_SECONDS: 604800
+          MAX_FILE_BYTES: 2000000000
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $botPath = "C:\file-to-link-bot"
+          $pidFile = "$botPath\bot.pid"
+          $stdout = "$botPath\bot.log"
+          $stderr = "$botPath\bot-error.log"
+
+          if (-not (Test-Path $pidFile)) { throw "Bot PID file was not found." }
+          $botPid = [int](Get-Content $pidFile)
+
+          Write-Host "============================================"
+          Write-Host "Windows VM is ready"
+          Write-Host "Bot PID: $botPid"
+          Write-Host "VM will remain alive for approximately 350 minutes."
+          Write-Host "============================================"
+
+          for ($minute = 0; $minute -lt 350; $minute += 5) {
+              Start-Sleep -Seconds 300
+              $process = Get-Process -Id $botPid -ErrorAction SilentlyContinue
+              if ($process) {
+                  Write-Host "[$minute minutes] VM alive | Bot PID $botPid running"
+                  continue
+              }
+
+              Write-Host "Bot process has stopped. Collecting diagnostics..."
+              if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG ====="; Get-Content $stderr -Tail 150 }
+              if (Test-Path $stdout) { Write-Host "===== BOT OUTPUT LOG ====="; Get-Content $stdout -Tail 150 }
+
+              $restartCount = 0
+              $restarted = $false
+              while ($restartCount -lt 3 -and -not $restarted) {
+                  $restartCount++
+                  Write-Host "Attempting bot restart $restartCount/3..."
+
+                  $python = (& py -3.13 -c "import sys; print(sys.executable)").Trim()
+                  if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path $python)) { throw "Could not resolve Python executable for bot restart." }
+
+                  $process = Start-Process -FilePath $python -ArgumentList "-u -m app.bot" -WorkingDirectory $botPath -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+                  $botPid = $process.Id
+                  $botPid | Out-File -FilePath $pidFile -Encoding ascii
+
+                  Start-Sleep -Seconds 15
+                  $process.Refresh()
+                  if (-not $process.HasExited) {
+                      Write-Host "Bot restart succeeded. New PID: $botPid"
+                      $restarted = $true
+                      break
+                  }
+
+                  Write-Host "Restarted bot exited. Exit code: $($process.ExitCode)"
+                  if (Test-Path $stderr) { Write-Host "===== BOT ERROR LOG AFTER RESTART ====="; Get-Content $stderr -Tail 150 }
+                  if ($restartCount -lt 3) { Start-Sleep -Seconds 15 }
+              }
+
+              if (-not $restarted) {
+                  throw "Bot could not be kept running after 3 restart attempts."
+              }
+          }
+
+      - name: 9. Cleanup
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "Stopping bot before runner shutdown..."
+          $pidFile = "C:\file-to-link-bot\bot.pid"
+
+          if (Test-Path $pidFile) {
+              try {
+                  $botPid = [int](Get-Content $pidFile)
+                  Stop-Process -Id $botPid -Force -ErrorAction SilentlyContinue
+                  Write-Host "Bot stopped."
+              }
+              catch {
+                  Write-Host "Bot process was already stopped."
+              }
+          }
+
+          Write-Host "Cleanup completed."
