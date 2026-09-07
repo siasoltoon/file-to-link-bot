@@ -28,6 +28,12 @@ TELEGRAM_DOWNLOAD_CONNECTIONS = max(
 TELEGRAM_DOWNLOAD_WORKERS = max(
     1, min(int(os.getenv("TELEGRAM_DOWNLOAD_WORKERS", "16")), 32)
 )
+TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS = max(
+    2.0, float(os.getenv("TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS", "5"))
+)
+TELEGRAM_DOWNLOAD_STALL_SECONDS = max(
+    10.0, float(os.getenv("TELEGRAM_DOWNLOAD_STALL_SECONDS", "15"))
+)
 
 
 class _ProgressReporter:
@@ -82,16 +88,6 @@ class _ProgressReporter:
         self._schedule(current)
 
 
-def _safe_filename(
-    name: str | None,
-    fallback_ext: str = "",
-    fallback_stem: str = "telegram_file",
-) -> str:
-    raw = Path(name or f"{fallback_stem}{fallback_ext}").name
-    raw = raw.replace("\x00", "_").replace("\r", "_").replace("\n", "_")
-    return (raw[:500] or f"{fallback_stem}{fallback_ext}")
-
-
 def _human_size(size: int | None) -> str:
     if not size:
         return "0 B"
@@ -105,6 +101,16 @@ def _human_size(size: int | None) -> str:
 
 def _human_rate(bytes_per_second: float) -> str:
     return f"{_human_size(bytes_per_second)}/s"
+
+
+def _safe_filename(
+    name: str | None,
+    fallback_ext: str = "",
+    fallback_stem: str = "telegram_file",
+) -> str:
+    raw = Path(name or f"{fallback_stem}{fallback_ext}").name
+    raw = raw.replace("\x00", "_").replace("\r", "_").replace("\n", "_")
+    return (raw[:500] or f"{fallback_stem}{fallback_ext}")
 
 
 async def _download_telegram_file(
@@ -143,21 +149,124 @@ async def _download_telegram_file(
     stride = worker_count * part_size
     downloaded_total = 0
     progress_lock = asyncio.Lock()
+    stats_lock = asyncio.Lock()
+    download_started = time.monotonic()
+    last_progress_time = download_started
+    last_logged_bytes = 0
+    last_logged_time = download_started
+    last_progress_seen = 0
+    worker_bytes = [0] * worker_count
+    worker_last_progress = [download_started] * worker_count
+    connection_bytes = [0] * connection_count
+    connection_last_progress = [download_started] * connection_count
+    stall_event = asyncio.Event()
+    stop_monitor = asyncio.Event()
 
     print(
-        f"Telegram file download: size={file_size} bytes, dc={document_dc_id}, "
-        f"connections={connection_count}, workers={worker_count}, part={part_size} bytes",
+        f"DOWNLOAD START: size={file_size} bytes ({_human_size(file_size)}), "
+        f"dc={document_dc_id}, connections={connection_count}, "
+        f"workers={worker_count}, part={part_size} bytes",
         flush=True,
     )
 
     with open(destination, "wb") as output:
         output.truncate(file_size)
 
+    async def log_stats(reason: str = "periodic") -> None:
+        nonlocal last_logged_bytes, last_logged_time, last_progress_seen
+        now = time.monotonic()
+        elapsed = max(now - download_started, 0.001)
+        interval_elapsed = max(now - last_logged_time, 0.001)
+        interval_bytes = downloaded_total - last_logged_bytes
+        average_rate = downloaded_total / elapsed
+        interval_rate = interval_bytes / interval_elapsed
+        percent = min(100.0, (downloaded_total / max(file_size, 1)) * 100)
+        remaining = max(file_size - downloaded_total, 0)
+        eta = (remaining / average_rate) if average_rate > 0 else 0
+
+        async with stats_lock:
+            wb = list(worker_bytes)
+            cb = list(connection_bytes)
+            wl = list(worker_last_progress)
+            cl = list(connection_last_progress)
+
+        worker_rates = []
+        for i, value in enumerate(wb):
+            worker_elapsed = max(now - download_started, 0.001)
+            worker_rates.append(value / worker_elapsed)
+
+        connection_rates = []
+        for value in cb:
+            connection_rates.append(value / elapsed)
+
+        active_workers = sum(
+            1 for timestamp in wl if now - timestamp < TELEGRAM_DOWNLOAD_STALL_SECONDS
+        )
+        active_connections = sum(
+            1 for timestamp in cl if now - timestamp < TELEGRAM_DOWNLOAD_STALL_SECONDS
+        )
+        print(
+            f"DOWNLOAD STATS [{reason}]: {percent:.2f}% | "
+            f"{_human_size(downloaded_total)}/{_human_size(file_size)} | "
+            f"avg={_human_rate(average_rate)} | interval={_human_rate(interval_rate)} | "
+            f"eta={eta:.1f}s | active_workers={active_workers}/{worker_count} | "
+            f"active_connections={active_connections}/{connection_count}",
+            flush=True,
+        )
+        print(
+            "DOWNLOAD CONNECTIONS: "
+            + " | ".join(
+                f"C{i + 1}={_human_size(value)} ({_human_rate(rate)}) "
+                f"last={max(0.0, now - cl[i]):.1f}s"
+                for i, (value, rate) in enumerate(zip(cb, connection_rates))
+            ),
+            flush=True,
+        )
+        stalled_workers = [
+            f"W{i + 1}({max(0.0, now - wl[i]):.1f}s)"
+            for i in range(worker_count)
+            if now - wl[i] >= TELEGRAM_DOWNLOAD_STALL_SECONDS
+        ]
+        if stalled_workers:
+            print(
+                "DOWNLOAD STALLED WORKERS: " + ", ".join(stalled_workers),
+                flush=True,
+            )
+
+        last_logged_bytes = downloaded_total
+        last_logged_time = now
+        last_progress_seen = downloaded_total
+
+    async def monitor() -> None:
+        nonlocal last_progress_time
+        while not stop_monitor.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop_monitor.wait(),
+                    timeout=TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS,
+                )
+                break
+            except asyncio.TimeoutError:
+                await log_stats("periodic")
+                if downloaded_total > last_progress_seen:
+                    last_progress_time = time.monotonic()
+                stalled_for = time.monotonic() - last_progress_time
+                if downloaded_total < file_size and stalled_for >= TELEGRAM_DOWNLOAD_STALL_SECONDS:
+                    if not stall_event.is_set():
+                        stall_event.set()
+                        print(
+                            f"DOWNLOAD STALL DETECTED: {downloaded_total}/{file_size} "
+                            f"({(downloaded_total / max(file_size, 1)) * 100:.2f}%), "
+                            f"no progress for {stalled_for:.1f}s",
+                            flush=True,
+                        )
+                        await log_stats("STALL")
+
     async def worker(worker_index: int, client) -> None:
-        nonlocal downloaded_total
+        nonlocal downloaded_total, last_progress_time
         offset = worker_index * part_size
         worker_started = time.monotonic()
-
+        connection_index = worker_index % connection_count
         iterator = client._iter_download(
             location,
             offset=offset,
@@ -169,16 +278,12 @@ async def _download_telegram_file(
             dc_id=document_dc_id,
         )
 
-        # Keep one file handle per worker instead of opening/closing the file for
-        # every 512 KiB chunk. This removes thousands of Windows file operations
-        # during a large download.
         with open(destination, "r+b", buffering=0) as output:
             try:
                 async for chunk in iterator:
                     chunk = bytes(chunk)
                     if not chunk:
                         break
-
                     output.seek(offset)
                     output.write(chunk)
                     offset += stride
@@ -186,14 +291,32 @@ async def _download_telegram_file(
                     async with progress_lock:
                         downloaded_total += len(chunk)
                         current = downloaded_total
+                        last_progress_time = time.monotonic()
+                    async with stats_lock:
+                        worker_bytes[worker_index] += len(chunk)
+                        worker_last_progress[worker_index] = time.monotonic()
+                        connection_bytes[connection_index] += len(chunk)
+                        connection_last_progress[connection_index] = time.monotonic()
                     progress_callback(current, file_size)
+            except Exception as exc:
+                print(
+                    f"DOWNLOAD WORKER ERROR: worker={worker_index + 1}/{worker_count} "
+                    f"connection={connection_index + 1}/{connection_count} "
+                    f"offset={offset} error={exc!r}",
+                    flush=True,
+                )
+                print(traceback.format_exc(), flush=True)
+                raise
             finally:
                 await iterator.close()
 
         elapsed = max(time.monotonic() - worker_started, 0.001)
+        worker_downloaded = worker_bytes[worker_index]
         print(
-            f"Telegram download worker {worker_index + 1}/{worker_count} finished: "
-            f"{_human_rate((offset - worker_index * part_size) / elapsed)}",
+            f"DOWNLOAD WORKER FINISHED: worker={worker_index + 1}/{worker_count} "
+            f"connection={connection_index + 1}/{connection_count} "
+            f"bytes={worker_downloaded} ({_human_size(worker_downloaded)}) "
+            f"avg={_human_rate(worker_downloaded / elapsed)}",
             flush=True,
         )
 
@@ -201,15 +324,31 @@ async def _download_telegram_file(
     if not clients:
         raise RuntimeError("No Telegram download connections are available")
 
+    monitor_task = asyncio.create_task(monitor())
     tasks = [
-        worker(index, clients[index % connection_count])
+        asyncio.create_task(worker(index, clients[index % connection_count]))
         for index in range(worker_count)
     ]
-    await asyncio.gather(*tasks)
-    print(
-        f"Telegram file download complete: {_human_size(downloaded_total)}",
-        flush=True,
-    )
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError(f"Telegram download failed in {len(errors)} worker(s): {errors[0]!r}")
+        if downloaded_total != file_size:
+            raise RuntimeError(
+                f"Telegram download incomplete: received {downloaded_total} of {file_size} bytes"
+            )
+        await log_stats("FINAL")
+        elapsed = max(time.monotonic() - download_started, 0.001)
+        print(
+            f"DOWNLOAD COMPLETE: {_human_size(downloaded_total)} in {elapsed:.1f}s "
+            f"avg={_human_rate(downloaded_total / elapsed)}",
+            flush=True,
+        )
+    finally:
+        stop_monitor.set()
+        await monitor_task
+
     return destination
 
 
