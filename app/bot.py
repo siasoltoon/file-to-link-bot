@@ -9,6 +9,7 @@ import traceback
 from pathlib import Path
 
 from telethon import TelegramClient, events
+from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
 from telethon.sessions import MemorySession
 from telethon.tl import types
 
@@ -17,10 +18,9 @@ from .storage import storage
 
 
 # Telegram upload.getFile allows at most 512 KiB per request.
-# We keep a small pool of authenticated MTProto connections, but run more
-# download iterators concurrently so several 512 KiB requests are in flight
-# at the same time. This is substantially more efficient than many requests
-# serialized through a single iterator while keeping the auth/session count low.
+# Keep a small pool of authenticated MTProto connections and let each
+# connection pipeline multiple requests. The downloader connections use
+# Telegram's lowest-overhead TCP transport and do not receive bot updates.
 TELEGRAM_DOWNLOAD_PART_SIZE_KB = 512
 TELEGRAM_DOWNLOAD_CONNECTIONS = max(
     1, min(int(os.getenv("TELEGRAM_DOWNLOAD_CONNECTIONS", "4")), 8)
@@ -129,6 +129,7 @@ async def _download_telegram_file(
         thumb_size="",
     )
     msg_data = (message.input_chat, message.id) if message.input_chat else None
+    document_dc_id = getattr(document, "dc_id", None)
 
     part_size = TELEGRAM_DOWNLOAD_PART_SIZE_KB * 1024
     worker_count = max(
@@ -143,12 +144,19 @@ async def _download_telegram_file(
     downloaded_total = 0
     progress_lock = asyncio.Lock()
 
+    print(
+        f"Telegram file download: size={file_size} bytes, dc={document_dc_id}, "
+        f"connections={connection_count}, workers={worker_count}, part={part_size} bytes",
+        flush=True,
+    )
+
     with open(destination, "wb") as output:
         output.truncate(file_size)
 
     async def worker(worker_index: int, client) -> None:
         nonlocal downloaded_total
         offset = worker_index * part_size
+        worker_started = time.monotonic()
 
         iterator = client._iter_download(
             location,
@@ -158,6 +166,7 @@ async def _download_telegram_file(
             request_size=part_size,
             file_size=file_size,
             msg_data=msg_data,
+            dc_id=document_dc_id,
         )
 
         # Keep one file handle per worker instead of opening/closing the file for
@@ -181,6 +190,13 @@ async def _download_telegram_file(
             finally:
                 await iterator.close()
 
+        elapsed = max(time.monotonic() - worker_started, 0.001)
+        print(
+            f"Telegram download worker {worker_index + 1}/{worker_count} finished: "
+            f"{_human_rate((offset - worker_index * part_size) / elapsed)}",
+            flush=True,
+        )
+
     clients = list(download_clients[:connection_count])
     if not clients:
         raise RuntimeError("No Telegram download connections are available")
@@ -190,6 +206,10 @@ async def _download_telegram_file(
         for index in range(worker_count)
     ]
     await asyncio.gather(*tasks)
+    print(
+        f"Telegram file download complete: {_human_size(downloaded_total)}",
+        flush=True,
+    )
     return destination
 
 
@@ -345,6 +365,8 @@ async def main() -> None:
                 downloader_session,
                 settings.telegram_api_id,
                 settings.telegram_api_hash,
+                connection=ConnectionTcpAbridged,
+                receive_updates=False,
                 request_retries=5,
                 connection_retries=5,
                 retry_delay=3,
@@ -357,7 +379,8 @@ async def main() -> None:
                 )
             download_clients.append(downloader)
             print(
-                f"Telegram download connection {index + 1}/{TELEGRAM_DOWNLOAD_CONNECTIONS} ready",
+                f"Telegram download connection {index + 1}/{TELEGRAM_DOWNLOAD_CONNECTIONS} ready "
+                f"(dc={downloader.session.dc_id}, transport=abridged)",
                 flush=True,
             )
 
@@ -381,7 +404,7 @@ async def main() -> None:
         print(
             f"Telegram downloader: {TELEGRAM_DOWNLOAD_CONNECTIONS} MTProto connections × "
             f"{TELEGRAM_DOWNLOAD_WORKERS} concurrent download workers × "
-            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests",
+            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests × abridged TCP",
             flush=True,
         )
         await client.run_until_disconnected()
