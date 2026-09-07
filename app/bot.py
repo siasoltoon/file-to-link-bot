@@ -9,9 +9,16 @@ import traceback
 from pathlib import Path
 
 from telethon import TelegramClient, events
+from telethon.tl import types
 
 from .config import settings
 from .storage import storage
+
+
+# Telegram upload.getFile allows at most 512 KiB per request.
+# Telethon may choose much smaller chunks for medium-sized files, which creates
+# many more round trips. Use the maximum valid chunk size for this bot's files.
+TELEGRAM_DOWNLOAD_PART_SIZE_KB = 512
 
 
 class _ProgressReporter:
@@ -91,6 +98,40 @@ def _human_rate(bytes_per_second: float) -> str:
     return f"{_human_size(bytes_per_second)}/s"
 
 
+async def _download_telegram_file(client, message, destination, file_size, progress_callback):
+    """Download a Telegram document using the largest legal MTProto chunk size.
+
+    We intentionally use Telethon's internal download primitive here because the
+    public ``download_media`` API does not expose ``part_size_kb``. The primitive
+    also accepts ``msg_data``, preserving Telethon's file-reference refresh logic
+    for long-running downloads.
+    """
+    document = getattr(message, "document", None)
+    if not isinstance(document, types.Document):
+        # Keep the normal Telethon path for media types that are not documents.
+        return await message.download_media(
+            file=destination,
+            progress_callback=progress_callback,
+        )
+
+    location = types.InputDocumentFileLocation(
+        id=document.id,
+        access_hash=document.access_hash,
+        file_reference=document.file_reference,
+        thumb_size="",
+    )
+    msg_data = (message.input_chat, message.id) if message.input_chat else None
+
+    return await client._download_file(
+        location,
+        destination,
+        part_size_kb=TELEGRAM_DOWNLOAD_PART_SIZE_KB,
+        file_size=file_size,
+        progress_callback=progress_callback,
+        msg_data=msg_data,
+    )
+
+
 async def _process_media(event) -> None:
     message = event.message
     if not message or not message.media:
@@ -130,9 +171,12 @@ async def _process_media(event) -> None:
 
         if size:
             download_progress = _ProgressReporter(status, loop, size, "⏬ دانلود از تلگرام")
-            downloaded = await message.download_media(
-                file=temp_path,
-                progress_callback=download_progress.download_callback,
+            downloaded = await _download_telegram_file(
+                event.client,
+                message,
+                temp_path,
+                size,
+                download_progress.download_callback,
             )
         else:
             await status.edit("⏬ در حال دانلود فایل از تلگرام...")
