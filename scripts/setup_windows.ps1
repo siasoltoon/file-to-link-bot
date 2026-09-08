@@ -35,13 +35,10 @@ function Ensure-ChocoPackage {
     )
 
     Write-Host "Checking application: $DisplayName ($Package)"
-    & choco list --local-only --exact $Package --limit-output | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        $installed = & choco list --local-only --exact $Package --limit-output
-        if ($installed -match "^$([regex]::Escape($Package))\|") {
-            Write-Host "Already installed: $DisplayName"
-            return
-        }
+    $installed = & choco list --local-only --exact $Package --limit-output 2>$null
+    if ($LASTEXITCODE -eq 0 -and $installed -match "^$([regex]::Escape($Package))\|") {
+        Write-Host "Already installed: $DisplayName"
+        return
     }
 
     Write-Host "Installing: $DisplayName"
@@ -55,13 +52,10 @@ function Ensure-ChocoPackage {
 Ensure-Chocolatey
 
 # User applications / utilities for every fresh Windows VPS.
-# These are intentionally installed idempotently: existing applications are reused.
+# Keep this list limited to applications explicitly requested by the user.
 $apps = @(
     @{ Package = "telegram"; DisplayName = "Telegram Desktop" },
     @{ Package = "internet-download-manager"; DisplayName = "Internet Download Manager (IDM)" },
-    @{ Package = "googlechrome"; DisplayName = "Google Chrome" },
-    @{ Package = "7zip"; DisplayName = "7-Zip" },
-    @{ Package = "vlc"; DisplayName = "VLC Media Player" },
     @{ Package = "git"; DisplayName = "Git" }
 )
 
