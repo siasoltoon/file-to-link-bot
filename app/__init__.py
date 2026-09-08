@@ -67,6 +67,12 @@ if _mtproxy_config is not None:
         from app.mtproxy_faketls import ConnectionTcpMTProxyFakeTLS
 
         class _EnvironmentMTProxyFakeTLSConnection(ConnectionTcpMTProxyFakeTLS):
+            @staticmethod
+            def address_info(proxy_info):
+                if isinstance(proxy_info, dict):
+                    return proxy_info["addr"], proxy_info["port"]
+                return proxy_info[:2]
+
             def __init__(self, ip, port, dc_id, *, loggers, proxy=None, local_addr=None):
                 super().__init__(
                     ip,
@@ -96,6 +102,12 @@ if _mtproxy_config is not None:
         )
 
         class _EnvironmentMTProxyConnection(_mtproxy_base):
+            @staticmethod
+            def address_info(proxy_info):
+                if isinstance(proxy_info, dict):
+                    return proxy_info["addr"], proxy_info["port"]
+                return proxy_info[:2]
+
             def __init__(self, ip, port, dc_id, *, loggers, proxy=None, local_addr=None):
                 super().__init__(
                     ip,
