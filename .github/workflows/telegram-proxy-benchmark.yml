@@ -23,9 +23,6 @@ on:
           - "3"
           - "4"
           - "5"
-  push:
-    branches:
-      - main
 
 jobs:
   benchmark:
@@ -35,9 +32,9 @@ jobs:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
       TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      TELEGRAM_DOWNLOAD_CONNECTIONS: ${{ inputs.connection_count || '4' }}
+      TELEGRAM_DOWNLOAD_CONNECTIONS: ${{ inputs.connection_count }}
       TELEGRAM_DOWNLOAD_WORKERS: "4"
-      TELEGRAM_DOWNLOAD_DC: ${{ inputs.download_dc || 'auto' }}
+      TELEGRAM_DOWNLOAD_DC: ${{ inputs.download_dc }}
       TELEGRAM_DOWNLOAD_PROXY_URL: ${{ secrets.TELEGRAM_DOWNLOAD_PROXY_URL }}
       S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
       S3_REGION: eu-west-1
