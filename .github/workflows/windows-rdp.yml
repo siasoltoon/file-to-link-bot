@@ -12,6 +12,17 @@ on:
           - "4"
           - "6"
           - "8"
+      download_dc:
+        description: "Telegram download DC: auto uses the file's DC"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - "auto"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
 
 jobs:
   windows-rdp:
@@ -23,6 +34,7 @@ jobs:
       TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       TELEGRAM_DOWNLOAD_CONNECTIONS: ${{ inputs.connection_count }}
       TELEGRAM_DOWNLOAD_WORKERS: "4"
+      TELEGRAM_DOWNLOAD_DC: ${{ inputs.download_dc }}
       S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
       S3_REGION: eu-west-1
       S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
@@ -122,6 +134,7 @@ jobs:
           }
           Write-Host "Telegram downloader connections: $env:TELEGRAM_DOWNLOAD_CONNECTIONS"
           Write-Host "Telegram downloader workers: $env:TELEGRAM_DOWNLOAD_WORKERS"
+          Write-Host "Telegram download DC: $env:TELEGRAM_DOWNLOAD_DC"
           if (Test-Path "C:\file-to-link-bot\file-to-link-bot.session") {
               Write-Host "Persistent Telegram session: restored"
               "TELEGRAM_SESSION_RESTORED=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -229,6 +242,7 @@ jobs:
           Write-Host "Bot PID: $botPid"
           Write-Host "Telegram download connections: $env:TELEGRAM_DOWNLOAD_CONNECTIONS"
           Write-Host "Telegram download workers: $env:TELEGRAM_DOWNLOAD_WORKERS"
+          Write-Host "Telegram download DC: $env:TELEGRAM_DOWNLOAD_DC"
           Write-Host "Persistent Telegram session restored: $env:TELEGRAM_SESSION_RESTORED"
           Write-Host "Health monitor interval: $monitorIntervalSeconds seconds"
           Write-Host "Live bot stdout/stderr streaming: enabled"
