@@ -194,17 +194,54 @@ jobs:
           $startedAt = Get-Date
           $lastHeartbeatMinute = -1
           $keepAliveMinutes = if ($env:TELEGRAM_SESSION_RESTORED -eq "1") { 350 } else { 300 }
+          $stdoutLineOffset = 0
+          $stderrLineOffset = 0
+
+          function Write-NewBotLogLines {
+              param(
+                  [string]$Path,
+                  [ref]$Offset,
+                  [string]$Label
+              )
+              if (-not (Test-Path -LiteralPath $Path)) { return }
+              try {
+                  $lines = @(Get-Content -LiteralPath $Path -Encoding utf8)
+                  if ($lines.Count -lt $Offset.Value) {
+                      Write-Host "[$Label] log file was reset; restarting live-log cursor."
+                      $Offset.Value = 0
+                  }
+                  if ($lines.Count -gt $Offset.Value) {
+                      for ($i = $Offset.Value; $i -lt $lines.Count; $i++) {
+                          Write-Host "[$Label] $($lines[$i])"
+                      }
+                      $Offset.Value = $lines.Count
+                  }
+              }
+              catch {
+                  Write-Host "[$Label] live log read warning: $($_.Exception.Message)"
+              }
+          }
+
           Write-Host "============================================"
           Write-Host "Windows VM is ready"
           Write-Host "Bot PID: $botPid"
           Write-Host "Telegram download connections: $env:TELEGRAM_DOWNLOAD_CONNECTIONS"
           Write-Host "Persistent Telegram session restored: $env:TELEGRAM_SESSION_RESTORED"
           Write-Host "Health monitor interval: $monitorIntervalSeconds seconds"
+          Write-Host "Live bot stdout/stderr streaming: enabled"
           Write-Host "VM will remain alive for approximately $keepAliveMinutes minutes."
           Write-Host "============================================"
+
+          Write-NewBotLogLines -Path $stdout -Offset ([ref]$stdoutLineOffset) -Label "BOT"
+          Write-NewBotLogLines -Path $stderr -Offset ([ref]$stderrLineOffset) -Label "BOT-ERROR"
+
           $deadline = $startedAt.AddMinutes($keepAliveMinutes)
           while ((Get-Date) -lt $deadline) {
               Start-Sleep -Seconds $monitorIntervalSeconds
+
+              Write-NewBotLogLines -Path $stdout -Offset ([ref]$stdoutLineOffset) -Label "BOT"
+              Write-NewBotLogLines -Path $stderr -Offset ([ref]$stderrLineOffset) -Label "BOT-ERROR"
+
               $process = Get-Process -Id $botPid -ErrorAction SilentlyContinue
               if ($process) {
                   $elapsedMinutes = [int]((New-TimeSpan -Start $startedAt -End (Get-Date)).TotalMinutes)
@@ -214,6 +251,7 @@ jobs:
                   }
                   continue
               }
+
               Write-Host "============================================"
               Write-Host "BOT CRASH DETECTED"
               Write-Host "Previous PID: $botPid"
@@ -225,6 +263,8 @@ jobs:
               for ($attempt = 1; $attempt -le $restartAttempts; $attempt++) {
                   Write-Host "Attempting bot restart $attempt/$restartAttempts..."
                   Remove-Item $stdout,$stderr -Force -ErrorAction SilentlyContinue
+                  $stdoutLineOffset = 0
+                  $stderrLineOffset = 0
                   $python = (& py -3.13 -c "import sys; print(sys.executable)").Trim()
                   if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path $python)) { throw "Could not resolve Python executable for bot restart." }
                   $process = Start-Process -FilePath $python -ArgumentList "-u -m app.bot" -WorkingDirectory $botPath -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
@@ -233,6 +273,8 @@ jobs:
                   Write-Host "New bot PID: $botPid"
                   Start-Sleep -Seconds 20
                   $process.Refresh()
+                  Write-NewBotLogLines -Path $stdout -Offset ([ref]$stdoutLineOffset) -Label "BOT"
+                  Write-NewBotLogLines -Path $stderr -Offset ([ref]$stderrLineOffset) -Label "BOT-ERROR"
                   if (-not $process.HasExited) {
                       Write-Host "Bot restart succeeded. New PID: $botPid"
                       $restarted = $true
