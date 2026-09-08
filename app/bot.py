@@ -9,6 +9,7 @@ import traceback
 from pathlib import Path
 
 from telethon import TelegramClient, events
+from telethon.errors import MessageNotModifiedError
 from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
 from telethon.sessions import MemorySession
 from telethon.tl import types
@@ -18,15 +19,15 @@ from .storage import storage
 
 
 # Telegram upload.getFile allows at most 512 KiB per request.
-# Keep a small pool of authenticated MTProto connections and let each
-# connection pipeline multiple requests. The downloader connections use
-# Telegram's lowest-overhead TCP transport and do not receive bot updates.
+# Keep a pool of independent MTProto connections and pipeline requests on
+# every connection. The downloader connections use Telegram's lowest-overhead
+# TCP transport and do not receive bot updates.
 TELEGRAM_DOWNLOAD_PART_SIZE_KB = 512
 TELEGRAM_DOWNLOAD_CONNECTIONS = max(
-    1, min(int(os.getenv("TELEGRAM_DOWNLOAD_CONNECTIONS", "4")), 8)
+    1, min(int(os.getenv("TELEGRAM_DOWNLOAD_CONNECTIONS", "8")), 8)
 )
 TELEGRAM_DOWNLOAD_WORKERS = max(
-    1, min(int(os.getenv("TELEGRAM_DOWNLOAD_WORKERS", "16")), 32)
+    1, min(int(os.getenv("TELEGRAM_DOWNLOAD_WORKERS", "32")), 32)
 )
 TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS = max(
     2.0, float(os.getenv("TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS", "5"))
@@ -34,10 +35,16 @@ TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS = max(
 TELEGRAM_DOWNLOAD_STALL_SECONDS = max(
     10.0, float(os.getenv("TELEGRAM_DOWNLOAD_STALL_SECONDS", "15"))
 )
+TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT_SECONDS = max(
+    8.0, float(os.getenv("TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT_SECONDS", "12"))
+)
+TELEGRAM_DOWNLOAD_MAX_RECOVERIES = max(
+    2, int(os.getenv("TELEGRAM_DOWNLOAD_MAX_RECOVERIES", "12"))
+)
 
 
 class _ProgressReporter:
-    """Throttle Telegram status edits while supporting callbacks from worker threads."""
+    """Throttle Telegram status edits and suppress harmless duplicate edits."""
 
     def __init__(self, status_message, loop, total: int, prefix: str) -> None:
         self.status_message = status_message
@@ -49,6 +56,7 @@ class _ProgressReporter:
         self.started_at = time.monotonic()
         self.lock = threading.Lock()
         self.pending_task = None
+        self.last_text = None
 
     def _schedule(self, current: int) -> None:
         percent = min(100, int((current / self.total) * 100))
@@ -60,9 +68,21 @@ class _ProgressReporter:
             f"🚀 سرعت میانگین: {_human_rate(rate)}"
         )
 
+        if text == self.last_text:
+            return
+        self.last_text = text
+
+        async def edit_status() -> None:
+            try:
+                await self.status_message.edit(text)
+            except MessageNotModifiedError:
+                pass
+            except Exception as exc:
+                print(f"progress status edit warning: {exc!r}", flush=True)
+
         def create_edit_task() -> None:
             if self.pending_task is None or self.pending_task.done():
-                self.pending_task = self.loop.create_task(self.status_message.edit(text))
+                self.pending_task = self.loop.create_task(edit_status())
 
         self.loop.call_soon_threadsafe(create_edit_task)
 
@@ -120,7 +140,7 @@ async def _download_telegram_file(
     file_size,
     progress_callback,
 ):
-    """Download a Telegram document using concurrent 512 KiB MTProto requests."""
+    """Download a Telegram document with parallel workers and self-healing connections."""
     document = getattr(message, "document", None)
     if not isinstance(document, types.Document):
         return await message.download_media(
@@ -150,22 +170,24 @@ async def _download_telegram_file(
     downloaded_total = 0
     progress_lock = asyncio.Lock()
     stats_lock = asyncio.Lock()
+    assignment_lock = asyncio.Lock()
     download_started = time.monotonic()
-    last_progress_time = download_started
     last_logged_bytes = 0
     last_logged_time = download_started
     last_progress_seen = 0
     worker_bytes = [0] * worker_count
     worker_last_progress = [download_started] * worker_count
+    worker_connection = [i % connection_count for i in range(worker_count)]
     connection_bytes = [0] * connection_count
     connection_last_progress = [download_started] * connection_count
-    stall_event = asyncio.Event()
+    connection_recoveries = [0] * connection_count
     stop_monitor = asyncio.Event()
 
     print(
         f"DOWNLOAD START: size={file_size} bytes ({_human_size(file_size)}), "
         f"dc={document_dc_id}, connections={connection_count}, "
-        f"workers={worker_count}, part={part_size} bytes",
+        f"workers={worker_count}, part={part_size} bytes, "
+        f"request_timeout={TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT_SECONDS:.1f}s",
         flush=True,
     )
 
@@ -185,25 +207,21 @@ async def _download_telegram_file(
         eta = (remaining / average_rate) if average_rate > 0 else 0
 
         async with stats_lock:
-            wb = list(worker_bytes)
             cb = list(connection_bytes)
-            wl = list(worker_last_progress)
             cl = list(connection_last_progress)
+            wc = list(worker_connection)
+            recoveries = list(connection_recoveries)
 
-        worker_rates = []
-        for i, value in enumerate(wb):
-            worker_elapsed = max(now - download_started, 0.001)
-            worker_rates.append(value / worker_elapsed)
-
-        connection_rates = []
-        for value in cb:
-            connection_rates.append(value / elapsed)
-
+        connection_rates = [value / elapsed for value in cb]
         active_workers = sum(
-            1 for timestamp in wl if now - timestamp < TELEGRAM_DOWNLOAD_STALL_SECONDS
+            1
+            for timestamp in worker_last_progress
+            if now - timestamp < TELEGRAM_DOWNLOAD_STALL_SECONDS
         )
         active_connections = sum(
-            1 for timestamp in cl if now - timestamp < TELEGRAM_DOWNLOAD_STALL_SECONDS
+            1
+            for timestamp in cl
+            if now - timestamp < TELEGRAM_DOWNLOAD_STALL_SECONDS
         )
         print(
             f"DOWNLOAD STATS [{reason}]: {percent:.2f}% | "
@@ -217,28 +235,26 @@ async def _download_telegram_file(
             "DOWNLOAD CONNECTIONS: "
             + " | ".join(
                 f"C{i + 1}={_human_size(value)} ({_human_rate(rate)}) "
-                f"last={max(0.0, now - cl[i]):.1f}s"
+                f"last={max(0.0, now - cl[i]):.1f}s "
+                f"workers={sum(1 for x in wc if x == i)} recoveries={recoveries[i]}"
                 for i, (value, rate) in enumerate(zip(cb, connection_rates))
             ),
             flush=True,
         )
         stalled_workers = [
-            f"W{i + 1}({max(0.0, now - wl[i]):.1f}s)"
+            f"W{i + 1}(C{wc[i] + 1},{max(0.0, now - worker_last_progress[i]):.1f}s)"
             for i in range(worker_count)
-            if now - wl[i] >= TELEGRAM_DOWNLOAD_STALL_SECONDS
+            if now - worker_last_progress[i] >= TELEGRAM_DOWNLOAD_STALL_SECONDS
         ]
         if stalled_workers:
-            print(
-                "DOWNLOAD STALLED WORKERS: " + ", ".join(stalled_workers),
-                flush=True,
-            )
+            print("DOWNLOAD STALLED WORKERS: " + ", ".join(stalled_workers), flush=True)
 
         last_logged_bytes = downloaded_total
         last_logged_time = now
         last_progress_seen = downloaded_total
 
     async def monitor() -> None:
-        nonlocal last_progress_time
+        nonlocal last_progress_seen
         while not stop_monitor.is_set():
             try:
                 await asyncio.wait_for(
@@ -248,75 +264,131 @@ async def _download_telegram_file(
                 break
             except asyncio.TimeoutError:
                 await log_stats("periodic")
-                if downloaded_total > last_progress_seen:
-                    last_progress_time = time.monotonic()
-                stalled_for = time.monotonic() - last_progress_time
-                if downloaded_total < file_size and stalled_for >= TELEGRAM_DOWNLOAD_STALL_SECONDS:
-                    if not stall_event.is_set():
-                        stall_event.set()
+                if downloaded_total == last_progress_seen and downloaded_total < file_size:
+                    stalled_for = time.monotonic() - max(worker_last_progress)
+                    if stalled_for >= TELEGRAM_DOWNLOAD_STALL_SECONDS:
                         print(
-                            f"DOWNLOAD STALL DETECTED: {downloaded_total}/{file_size} "
-                            f"({(downloaded_total / max(file_size, 1)) * 100:.2f}%), "
-                            f"no progress for {stalled_for:.1f}s",
+                            f"DOWNLOAD GLOBAL STALL: no worker progress for {stalled_for:.1f}s",
                             flush=True,
                         )
-                        await log_stats("STALL")
 
-    async def worker(worker_index: int, client) -> None:
-        nonlocal downloaded_total, last_progress_time
+    async def choose_recovery_connection(current_connection: int) -> int:
+        async with assignment_lock:
+            now = time.monotonic()
+            candidates = [i for i in range(connection_count) if i != current_connection]
+            if not candidates:
+                return current_connection
+            candidates.sort(
+                key=lambda i: (
+                    now - connection_last_progress[i],
+                    connection_recoveries[i],
+                )
+            )
+            selected = candidates[0]
+            return selected
+
+    async def worker(worker_index: int) -> None:
+        nonlocal downloaded_total
         offset = worker_index * part_size
         worker_started = time.monotonic()
-        connection_index = worker_index % connection_count
-        iterator = client._iter_download(
-            location,
-            offset=offset,
-            stride=stride,
-            chunk_size=part_size,
-            request_size=part_size,
-            file_size=file_size,
-            msg_data=msg_data,
-            dc_id=document_dc_id,
-        )
+        recoveries = 0
 
         with open(destination, "r+b", buffering=0) as output:
-            try:
-                async for chunk in iterator:
-                    chunk = bytes(chunk)
-                    if not chunk:
-                        break
-                    output.seek(offset)
-                    output.write(chunk)
-                    offset += stride
-
-                    async with progress_lock:
-                        downloaded_total += len(chunk)
-                        current = downloaded_total
-                        last_progress_time = time.monotonic()
-                    async with stats_lock:
-                        worker_bytes[worker_index] += len(chunk)
-                        worker_last_progress[worker_index] = time.monotonic()
-                        connection_bytes[connection_index] += len(chunk)
-                        connection_last_progress[connection_index] = time.monotonic()
-                    progress_callback(current, file_size)
-            except Exception as exc:
-                print(
-                    f"DOWNLOAD WORKER ERROR: worker={worker_index + 1}/{worker_count} "
-                    f"connection={connection_index + 1}/{connection_count} "
-                    f"offset={offset} error={exc!r}",
-                    flush=True,
+            while offset < file_size:
+                async with stats_lock:
+                    connection_index = worker_connection[worker_index]
+                client = download_clients[connection_index]
+                iterator = client._iter_download(
+                    location,
+                    offset=offset,
+                    stride=stride,
+                    chunk_size=part_size,
+                    request_size=part_size,
+                    file_size=file_size,
+                    msg_data=msg_data,
+                    dc_id=document_dc_id,
                 )
-                print(traceback.format_exc(), flush=True)
-                raise
-            finally:
-                await iterator.close()
+                iterator_closed = False
+                try:
+                    while offset < file_size:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                iterator.__anext__(),
+                                timeout=TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT_SECONDS,
+                            )
+                        except StopAsyncIteration:
+                            break
+                        chunk = bytes(chunk)
+                        if not chunk:
+                            break
+
+                        output.seek(offset)
+                        output.write(chunk)
+                        offset += stride
+
+                        now = time.monotonic()
+                        async with progress_lock:
+                            downloaded_total += len(chunk)
+                            current = downloaded_total
+                        async with stats_lock:
+                            worker_bytes[worker_index] += len(chunk)
+                            worker_last_progress[worker_index] = now
+                            connection_bytes[connection_index] += len(chunk)
+                            connection_last_progress[connection_index] = now
+                        progress_callback(current, file_size)
+
+                    if offset >= file_size:
+                        break
+                    # Iterator ended unexpectedly before this worker reached EOF.
+                    raise RuntimeError(
+                        f"download iterator ended early at offset={offset}"
+                    )
+                except asyncio.TimeoutError:
+                    recoveries += 1
+                    if recoveries > TELEGRAM_DOWNLOAD_MAX_RECOVERIES:
+                        raise RuntimeError(
+                            f"worker {worker_index + 1} exceeded maximum recovery attempts "
+                            f"({TELEGRAM_DOWNLOAD_MAX_RECOVERIES}) at offset {offset}"
+                        )
+                    try:
+                        await iterator.close()
+                        iterator_closed = True
+                    except Exception:
+                        pass
+                    new_connection = await choose_recovery_connection(connection_index)
+                    async with stats_lock:
+                        worker_connection[worker_index] = new_connection
+                        connection_recoveries[connection_index] += 1
+                    print(
+                        f"DOWNLOAD CONNECTION RECOVERY: worker={worker_index + 1}/{worker_count} "
+                        f"C{connection_index + 1}->C{new_connection + 1} "
+                        f"offset={offset} recovery={recoveries}",
+                        flush=True,
+                    )
+                    await asyncio.sleep(0.15)
+                    continue
+                except Exception as exc:
+                    print(
+                        f"DOWNLOAD WORKER ERROR: worker={worker_index + 1}/{worker_count} "
+                        f"connection={connection_index + 1}/{connection_count} "
+                        f"offset={offset} error={exc!r}",
+                        flush=True,
+                    )
+                    print(traceback.format_exc(), flush=True)
+                    raise
+                finally:
+                    if not iterator_closed:
+                        try:
+                            await iterator.close()
+                        except Exception:
+                            pass
 
         elapsed = max(time.monotonic() - worker_started, 0.001)
-        worker_downloaded = worker_bytes[worker_index]
         print(
             f"DOWNLOAD WORKER FINISHED: worker={worker_index + 1}/{worker_count} "
-            f"connection={connection_index + 1}/{connection_count} "
-            f"bytes={worker_downloaded} ({_human_size(worker_downloaded)}) "
-            f"avg={_human_rate(worker_downloaded / elapsed)}",
+            f"bytes={worker_bytes[worker_index]} ({_human_size(worker_bytes[worker_index])}) "
+            f"avg={_human_rate(worker_bytes[worker_index] / elapsed)} "
+            f"recoveries={recoveries}",
             flush=True,
         )
 
@@ -325,15 +397,14 @@ async def _download_telegram_file(
         raise RuntimeError("No Telegram download connections are available")
 
     monitor_task = asyncio.create_task(monitor())
-    tasks = [
-        asyncio.create_task(worker(index, clients[index % connection_count]))
-        for index in range(worker_count)
-    ]
+    tasks = [asyncio.create_task(worker(index)) for index in range(worker_count)]
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         errors = [result for result in results if isinstance(result, BaseException)]
         if errors:
-            raise RuntimeError(f"Telegram download failed in {len(errors)} worker(s): {errors[0]!r}")
+            raise RuntimeError(
+                f"Telegram download failed in {len(errors)} worker(s): {errors[0]!r}"
+            )
         if downloaded_total != file_size:
             raise RuntimeError(
                 f"Telegram download incomplete: received {downloaded_total} of {file_size} bytes"
@@ -543,7 +614,7 @@ async def main() -> None:
         print(
             f"Telegram downloader: {TELEGRAM_DOWNLOAD_CONNECTIONS} MTProto connections × "
             f"{TELEGRAM_DOWNLOAD_WORKERS} concurrent download workers × "
-            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests × abridged TCP",
+            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests × abridged TCP × self-healing",
             flush=True,
         )
         await client.run_until_disconnected()
