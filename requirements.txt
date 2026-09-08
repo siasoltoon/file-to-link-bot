@@ -4,5 +4,4 @@ pydantic-settings>=2.10,<3
 SQLAlchemy>=2.0,<3
 Telethon>=1.40,<1.41
 cryptg>=0.5,<1
-python-socks[asyncio]>=2.5,<3
 uvicorn[standard]>=0.35,<1
