@@ -29,6 +29,7 @@ TELEGRAM_DOWNLOAD_CONNECTIONS = max(
 TELEGRAM_DOWNLOAD_WORKERS = max(
     1, min(int(os.getenv("TELEGRAM_DOWNLOAD_WORKERS", "32")), 32)
 )
+TELEGRAM_DOWNLOAD_DC = os.getenv("TELEGRAM_DOWNLOAD_DC", "auto").strip().lower()
 TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS = max(
     2.0, float(os.getenv("TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS", "5"))
 )
@@ -156,6 +157,17 @@ async def _download_telegram_file(
     )
     msg_data = (message.input_chat, message.id) if message.input_chat else None
     document_dc_id = getattr(document, "dc_id", None)
+    if TELEGRAM_DOWNLOAD_DC == "auto":
+        requested_dc_id = document_dc_id
+    else:
+        try:
+            requested_dc_id = int(TELEGRAM_DOWNLOAD_DC)
+        except ValueError as exc:
+            raise ValueError(
+                "TELEGRAM_DOWNLOAD_DC must be 'auto' or a numeric Telegram DC id"
+            ) from exc
+        if requested_dc_id < 1 or requested_dc_id > 5:
+            raise ValueError("TELEGRAM_DOWNLOAD_DC must be auto or one of 1,2,3,4,5")
 
     part_size = TELEGRAM_DOWNLOAD_PART_SIZE_KB * 1024
     worker_count = max(
@@ -185,8 +197,8 @@ async def _download_telegram_file(
 
     print(
         f"DOWNLOAD START: size={file_size} bytes ({_human_size(file_size)}), "
-        f"dc={document_dc_id}, connections={connection_count}, "
-        f"workers={worker_count}, part={part_size} bytes, "
+        f"document_dc={document_dc_id}, requested_dc={requested_dc_id}, "
+        f"connections={connection_count}, workers={worker_count}, part={part_size} bytes, "
         f"request_timeout={TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT_SECONDS:.1f}s",
         flush=True,
     )
@@ -339,7 +351,7 @@ async def _download_telegram_file(
                     request_size=part_size,
                     file_size=file_size,
                     msg_data=msg_data,
-                    dc_id=document_dc_id,
+                    dc_id=requested_dc_id,
                 )
                 iterator_closed = False
                 try:
@@ -372,7 +384,6 @@ async def _download_telegram_file(
 
                     if offset >= file_size:
                         break
-                    # Iterator ended unexpectedly before this worker reached EOF.
                     raise RuntimeError(
                         f"download iterator ended early at offset={offset}"
                     )
@@ -638,7 +649,7 @@ async def main() -> None:
         print(
             f"Telegram downloader: {TELEGRAM_DOWNLOAD_CONNECTIONS} MTProto connections × "
             f"{TELEGRAM_DOWNLOAD_WORKERS} concurrent download workers × "
-            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests × abridged TCP × self-healing",
+            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests × abridged TCP × self-healing × dc={TELEGRAM_DOWNLOAD_DC}",
             flush=True,
         )
         await client.run_until_disconnected()
