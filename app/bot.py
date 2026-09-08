@@ -19,9 +19,9 @@ from .storage import storage
 
 
 # Telegram upload.getFile allows at most 512 KiB per request.
-# Keep a pool of independent MTProto connections and pipeline requests on
-# every connection. The downloader connections use Telegram's lowest-overhead
-# TCP transport and do not receive bot updates.
+# Keep a pool of independent MTProto connections. In the normal 4x4 setup
+# every worker gets its own connection, while larger worker counts can safely
+# share the pool. The downloader connections do not receive bot updates.
 TELEGRAM_DOWNLOAD_PART_SIZE_KB = 512
 TELEGRAM_DOWNLOAD_CONNECTIONS = max(
     1, min(int(os.getenv("TELEGRAM_DOWNLOAD_CONNECTIONS", "8")), 8)
@@ -41,6 +41,12 @@ TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT_SECONDS = max(
 )
 TELEGRAM_DOWNLOAD_MAX_RECOVERIES = max(
     2, int(os.getenv("TELEGRAM_DOWNLOAD_MAX_RECOVERIES", "12"))
+)
+TELEGRAM_DOWNLOAD_RECONNECT_TIMEOUT_SECONDS = max(
+    5.0, float(os.getenv("TELEGRAM_DOWNLOAD_RECONNECT_TIMEOUT_SECONDS", "15"))
+)
+TELEGRAM_DOWNLOAD_RECOVERY_COOLDOWN_SECONDS = max(
+    0.5, float(os.getenv("TELEGRAM_DOWNLOAD_RECOVERY_COOLDOWN_SECONDS", "3"))
 )
 
 
@@ -193,6 +199,8 @@ async def _download_telegram_file(
     connection_bytes = [0] * connection_count
     connection_last_progress = [download_started] * connection_count
     connection_recoveries = [0] * connection_count
+    connection_last_failure = [0.0] * connection_count
+    connection_locks = [asyncio.Lock() for _ in range(connection_count)]
     stop_monitor = asyncio.Event()
 
     print(
@@ -223,6 +231,7 @@ async def _download_telegram_file(
             cl = list(connection_last_progress)
             wc = list(worker_connection)
             recoveries = list(connection_recoveries)
+            failures = list(connection_last_failure)
 
         connection_rates = [value / elapsed for value in cb]
         active_workers = sum(
@@ -248,7 +257,8 @@ async def _download_telegram_file(
             + " | ".join(
                 f"C{i + 1}={_human_size(value)} ({_human_rate(rate)}) "
                 f"last={max(0.0, now - cl[i]):.1f}s "
-                f"workers={sum(1 for x in wc if x == i)} recoveries={recoveries[i]}"
+                f"recoveries={recoveries[i]} "
+                f"cooldown={max(0.0, TELEGRAM_DOWNLOAD_RECOVERY_COOLDOWN_SECONDS - (now - failures[i])):.1f}s"
                 for i, (value, rate) in enumerate(zip(cb, connection_rates))
             ),
             flush=True,
@@ -287,21 +297,67 @@ async def _download_telegram_file(
     async def choose_recovery_connection(current_connection: int) -> int:
         async with assignment_lock:
             now = time.monotonic()
+            worker_load = [0] * connection_count
+            for assigned in worker_connection:
+                worker_load[assigned] += 1
             candidates = [i for i in range(connection_count) if i != current_connection]
-            if not candidates:
+            healthy = [
+                i
+                for i in candidates
+                if now - connection_last_failure[i] >= TELEGRAM_DOWNLOAD_RECOVERY_COOLDOWN_SECONDS
+            ]
+            pool = healthy or candidates
+            if not pool:
                 return current_connection
-            candidates.sort(
+            pool.sort(
                 key=lambda i: (
-                    now - connection_last_progress[i],
+                    worker_load[i],
                     connection_recoveries[i],
+                    -connection_last_progress[i],
                 )
             )
-            return candidates[0]
+            return pool[0]
+
+    async def reconnect_connection(connection_index: int) -> None:
+        client = download_clients[connection_index]
+        lock = connection_locks[connection_index]
+        async with lock:
+            try:
+                if client.is_connected():
+                    await asyncio.wait_for(
+                        client.disconnect(),
+                        timeout=TELEGRAM_DOWNLOAD_RECONNECT_TIMEOUT_SECONDS,
+                    )
+            except Exception as exc:
+                print(
+                    f"DOWNLOAD CONNECTION DISCONNECT WARNING: C{connection_index + 1} {exc!r}",
+                    flush=True,
+                )
+            try:
+                await asyncio.wait_for(
+                    client.connect(),
+                    timeout=TELEGRAM_DOWNLOAD_RECONNECT_TIMEOUT_SECONDS,
+                )
+                if not client.is_connected():
+                    raise RuntimeError("connection did not report connected state")
+                print(
+                    f"DOWNLOAD CONNECTION RECONNECTED: C{connection_index + 1} "
+                    f"dc={client.session.dc_id}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"DOWNLOAD CONNECTION RECONNECT FAILED: C{connection_index + 1} {exc!r}",
+                    flush=True,
+                )
+                raise
 
     def is_recoverable_download_error(exc: BaseException) -> bool:
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError)):
             return True
         if isinstance(exc, ValueError) and "Request was unsuccessful" in str(exc):
+            return True
+        if isinstance(exc, RuntimeError) and "download iterator ended early" in str(exc):
             return True
         return False
 
@@ -317,6 +373,16 @@ async def _download_telegram_file(
                 f"worker {worker_index + 1} exceeded maximum recovery attempts "
                 f"({TELEGRAM_DOWNLOAD_MAX_RECOVERIES}) at offset {offset}: {reason!r}"
             ) from reason
+
+        async with stats_lock:
+            connection_last_failure[current_connection] = time.monotonic()
+
+        # Reset the failed transport before reusing the pool. This prevents a
+        # half-open MTProto socket from being selected repeatedly after a timeout.
+        try:
+            await reconnect_connection(current_connection)
+        except Exception:
+            pass
 
         new_connection = await choose_recovery_connection(current_connection)
         async with stats_lock:
@@ -343,6 +409,9 @@ async def _download_telegram_file(
                 async with stats_lock:
                     connection_index = worker_connection[worker_index]
                 client = download_clients[connection_index]
+                if not client.is_connected():
+                    await reconnect_connection(connection_index)
+
                 iterator = client._iter_download(
                     location,
                     offset=offset,
@@ -390,7 +459,10 @@ async def _download_telegram_file(
                 except Exception as exc:
                     if is_recoverable_download_error(exc):
                         try:
-                            await iterator.close()
+                            await asyncio.wait_for(
+                                iterator.close(),
+                                timeout=3.0,
+                            )
                             iterator_closed = True
                         except Exception:
                             pass
@@ -414,7 +486,7 @@ async def _download_telegram_file(
                 finally:
                     if not iterator_closed:
                         try:
-                            await iterator.close()
+                            await asyncio.wait_for(iterator.close(), timeout=3.0)
                         except Exception:
                             pass
 
