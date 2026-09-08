@@ -1,6 +1,7 @@
 """Application package initialization and Telegram download policy."""
 
 import os
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 # Telegram files must be downloaded from their actual document DC. Never force
@@ -15,18 +16,119 @@ if _requested_dc not in {"", "auto"}:
     os.environ["TELEGRAM_DOWNLOAD_DC"] = "auto"
 
 
-# The downloader imports ConnectionTcpAbridged directly. Keep transport
-# selection centralized here. Telethon 1.40.0 does not provide a
-# tcpobfuscated2 module, so that experimental profile is invalid and must not
-# be the default. Full and Abridged are the supported profiles used by this
-# project.
+# The downloader imports ConnectionTcpAbridged directly. Keep transport and
+# route selection centralized here so the existing bot.py remains compatible.
+# Telethon 1.40.0 supports classic MTProxy through tcpmtproxy.py, including
+# hex/base64 secrets. Modern Fake-TLS (ee...) secrets are intentionally rejected
+# because they need a different protocol implementation than this pinned
+# Telethon version.
+_proxy_url = os.getenv("TELEGRAM_DOWNLOAD_PROXY_URL", "").strip()
+_mtproxy_config = None
+
+
+def _parse_mtproxy_url(value: str):
+    """Parse common MTProto proxy links without logging the secret."""
+    if not value:
+        return None
+
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    if scheme in {"tg", "https", "http"} and parsed.query:
+        query = parse_qs(parsed.query)
+        if "server" in query and "port" in query and "secret" in query:
+            host = query["server"][0].strip()
+            port = int(query["port"][0])
+            secret = unquote(query["secret"][0]).strip()
+            if host and 1 <= port <= 65535 and secret:
+                return host, port, secret
+
+    if scheme in {"mtproto", "mtproxy"}:
+        host = parsed.hostname
+        port = parsed.port
+        secret = ""
+        if parsed.path and parsed.path != "/":
+            secret = unquote(parsed.path.lstrip("/"))
+        if not secret:
+            query = parse_qs(parsed.query)
+            secret = unquote(query.get("secret", [""])[0]).strip()
+        if host and port and secret:
+            return host, port, secret
+
+    return None
+
+
+_mtproxy_config = _parse_mtproxy_url(_proxy_url)
+if _mtproxy_config is not None:
+    _mtproxy_host, _mtproxy_port, _mtproxy_secret = _mtproxy_config
+    if _mtproxy_secret.lower().startswith("ee"):
+        raise ValueError(
+            "This Telethon 1.40.0 build does not support modern Fake-TLS "
+            "MTProxy secrets starting with 'ee'. Use a classic MTProxy secret "
+            "for this benchmark."
+        )
+
+    # bot.py currently validates TELEGRAM_DOWNLOAD_PROXY_URL as a SOCKS/HTTP
+    # URL. Convert only the visible proxy configuration to a harmless HTTP-shaped
+    # value so its existing validation/logging stays enabled. The actual socket
+    # class below ignores that value and uses the real MTProxy secret.
+    os.environ["TELEGRAM_DOWNLOAD_PROXY_URL"] = (
+        f"http://{_mtproxy_host}:{_mtproxy_port}"
+    )
+
+
 _transport = os.getenv("TELEGRAM_DOWNLOAD_TRANSPORT", "full").strip().lower()
-if _transport not in {"full", "abridged"}:
+if _mtproxy_config is not None:
+    _transport = "mtproxy"
+elif _transport not in {"full", "abridged"}:
     raise ValueError(
         "TELEGRAM_DOWNLOAD_TRANSPORT must be 'full' or 'abridged'"
     )
 
-if _transport == "full":
+
+if _mtproxy_config is not None:
+    import telethon.network.connection.tcpabridged as _tcpabridged
+    from telethon.network.connection.tcpmtproxy import (
+        ConnectionTcpMTProxyAbridged,
+        ConnectionTcpMTProxyRandomizedIntermediate,
+    )
+
+    _mtproxy_host, _mtproxy_port, _mtproxy_secret = _mtproxy_config
+    _mtproxy_base = (
+        ConnectionTcpMTProxyRandomizedIntermediate
+        if _mtproxy_secret.lower().startswith("dd")
+        else ConnectionTcpMTProxyAbridged
+    )
+
+    class _EnvironmentMTProxyConnection(_mtproxy_base):
+        """Bind Telethon's MTProxy connection to the repository env secret."""
+
+        def __init__(
+            self,
+            ip,
+            port,
+            dc_id,
+            *,
+            loggers,
+            proxy=None,
+            local_addr=None,
+        ):
+            super().__init__(
+                ip,
+                port,
+                dc_id,
+                loggers=loggers,
+                proxy=(_mtproxy_host, _mtproxy_port, _mtproxy_secret),
+                local_addr=local_addr,
+            )
+
+    _tcpabridged.ConnectionTcpAbridged = _EnvironmentMTProxyConnection
+    print(
+        "Telegram download route: MTProto proxy enabled "
+        f"host={_mtproxy_host} port={_mtproxy_port} "
+        f"protocol={'randomized-intermediate' if _mtproxy_base is ConnectionTcpMTProxyRandomizedIntermediate else 'abridged'}",
+        flush=True,
+    )
+elif _transport == "full":
     import telethon.network.connection.tcpabridged as _tcpabridged
     from telethon.network.connection.tcpfull import ConnectionTcpFull
 
