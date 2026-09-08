@@ -78,7 +78,7 @@ for ($i = 1; $i -le 5; $i++) {
         $client = [System.Net.Sockets.TcpClient]::new()
         $task = $client.ConnectAsync($dc4, 443)
         if (-not $task.Wait(10000)) {
-            Write-Host "DC4 attempt $i: TIMEOUT"
+            Write-Host "DC4 attempt ${i}: TIMEOUT"
             $client.Dispose()
             continue
         }
@@ -86,7 +86,7 @@ for ($i = 1; $i -le 5; $i++) {
         Write-Host ("DC4 attempt {0}: connect_ms={1:N1}" -f $i, $sw.Elapsed.TotalMilliseconds)
         $client.Dispose()
     } catch {
-        Write-Host "DC4 attempt $i: FAILED: $($_.Exception.Message)"
+        Write-Host "DC4 attempt ${i}: FAILED: $($_.Exception.Message)"
     }
 }
 
