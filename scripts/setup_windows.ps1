@@ -15,4 +15,8 @@ if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
 
 New-Item -ItemType Directory -Force -Path ".\data" | Out-Null
 
+Write-Host "Running Telegram network diagnostics..."
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\network_diagnostics.ps1"
+if ($LASTEXITCODE -ne 0) { throw "Network diagnostics failed." }
+
 Write-Host "Windows bot environment is ready."
