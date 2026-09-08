@@ -15,12 +15,30 @@ from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomize
 
 
 def _decode_secret(value: str) -> bytes:
+    """Decode an MTProxy secret in either hex or URL-safe base64 form.
+
+    Modern Fake-TLS links conventionally expose the ``ee`` marker as part of
+    the secret string.  The upstream telethon-faketls implementation treats
+    that marker separately: first it tries ``ee + payload`` as hex, then
+    falls back to ``7 + payload`` as base64.  Do the same here.
+    """
     value = value.strip()
-    if value.lower().startswith("ee"):
-        return bytes.fromhex(value)
-    cleaned = re.sub(r"[^a-zA-Z0-9+/=_-]+", "", value)
-    encoded = "7" + cleaned
-    return base64.urlsafe_b64decode(encoded.encode() + b"=" * (-len(encoded) % 4))
+    if not value:
+        raise ValueError("MTProxy Fake-TLS secret is empty")
+
+    payload = value[2:] if value.lower().startswith("ee") else value
+
+    try:
+        return bytes.fromhex("ee" + payload)
+    except ValueError:
+        cleaned = re.sub(r"[^a-zA-Z0-9+/=_-]+", "", payload)
+        encoded = "7" + cleaned
+        try:
+            return base64.urlsafe_b64decode(
+                encoded.encode() + b"=" * (-len(encoded) % 4)
+            )
+        except Exception as exc:
+            raise ValueError("Invalid MTProxy Fake-TLS secret encoding") from exc
 
 
 def _hmac_sha256(key: bytes, msg: bytes) -> bytes:
