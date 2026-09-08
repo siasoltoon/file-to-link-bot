@@ -1,6 +1,9 @@
 """Application package initialization and Telegram download policy."""
 
+import base64
+import binascii
 import os
+import re
 from urllib.parse import parse_qs, unquote, urlparse
 
 
@@ -44,18 +47,83 @@ def _parse_mtproxy_url(value: str):
     return None
 
 
+def _decode_base64_secret(value: str):
+    """Decode a standard base64 MTProxy secret when it represents 16 bytes."""
+    cleaned = re.sub(r"\s+", "", value)
+    if not cleaned or not re.fullmatch(r"[A-Za-z0-9+/=_-]+", cleaned):
+        return None
+    try:
+        padded = cleaned + "=" * (-len(cleaned) % 4)
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    return decoded if len(decoded) == 16 else None
+
+
+def _classify_mtproxy_secret(secret: str):
+    """Return (transport, secret_for_telethon) without exposing the secret.
+
+    ``ee`` at the beginning of the *text* is not by itself proof of Fake-TLS.
+    A normal 16-byte base64 MTProxy secret can legitimately begin with the
+    characters ``ee``. Fake-TLS is selected only for a structurally valid
+    Fake-TLS secret: an ``ee`` hex secret containing a key plus domain, or a
+    base64 Fake-TLS secret beginning with ``7`` that decodes to at least
+    17 bytes.
+    """
+    value = secret.strip()
+    lower = value.lower()
+
+    if lower.startswith("ee"):
+        payload = value[2:]
+        if len(payload) >= 32 and len(payload) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", payload):
+            decoded = bytes.fromhex("ee" + payload)
+            if len(decoded) >= 17 and decoded[17:]:
+                return "mtproxy-faketls", value
+
+    if lower.startswith("7"):
+        decoded = _decode_base64_secret(value[1:])
+        if decoded is not None:
+            return "mtproxy-faketls", value
+        try:
+            padded = value + "=" * (-len(value) % 4)
+            decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+        except (ValueError, binascii.Error):
+            decoded = None
+        if decoded is not None and len(decoded) >= 17:
+            return "mtproxy-faketls", value
+
+    if len(value) == 32 and re.fullmatch(r"[0-9a-fA-F]{32}", value):
+        return "mtproxy", value
+
+    if lower.startswith("dd") and len(value) == 34 and re.fullmatch(r"[0-9a-fA-F]{34}", value):
+        return "mtproxy", value
+
+    decoded = _decode_base64_secret(value)
+    if decoded is not None:
+        # Convert base64 to hex before handing it to Telethon. This avoids
+        # Telethon mistaking a perfectly valid base64 secret beginning with
+        # the text "ee" for an EE Fake-TLS marker.
+        return "mtproxy", decoded.hex()
+
+    raise ValueError(
+        "Unsupported MTProxy secret format. Expected a 16-byte hex/base64 "
+        "secret or a structurally valid Fake-TLS secret."
+    )
+
+
 _mtproxy_config = _parse_mtproxy_url(_proxy_url)
 if _mtproxy_config is not None:
     _mtproxy_host, _mtproxy_port, _mtproxy_secret = _mtproxy_config
-    # bot.py's existing proxy validator expects an HTTP/SOCKS-shaped URL.
-    # Keep that compatibility value while the connection class uses the real
-    # MTProxy secret internally.
+    _mtproxy_transport, _mtproxy_secret_for_telethon = _classify_mtproxy_secret(_mtproxy_secret)
     os.environ["TELEGRAM_DOWNLOAD_PROXY_URL"] = f"http://{_mtproxy_host}:{_mtproxy_port}"
+else:
+    _mtproxy_transport = None
+    _mtproxy_secret_for_telethon = None
 
 
 _transport = os.getenv("TELEGRAM_DOWNLOAD_TRANSPORT", "full").strip().lower()
 if _mtproxy_config is not None:
-    _transport = "mtproxy-faketls" if _mtproxy_secret.lower().startswith("ee") else "mtproxy"
+    _transport = _mtproxy_transport
 elif _transport not in {"full", "abridged"}:
     raise ValueError("TELEGRAM_DOWNLOAD_TRANSPORT must be 'full' or 'abridged'")
 
@@ -63,7 +131,7 @@ elif _transport not in {"full", "abridged"}:
 import telethon.network.connection.tcpabridged as _tcpabridged
 
 if _mtproxy_config is not None:
-    if _mtproxy_secret.lower().startswith("ee"):
+    if _mtproxy_transport == "mtproxy-faketls":
         from app.mtproxy_faketls import ConnectionTcpMTProxyFakeTLS
 
         class _EnvironmentMTProxyFakeTLSConnection(ConnectionTcpMTProxyFakeTLS):
@@ -97,7 +165,7 @@ if _mtproxy_config is not None:
 
         _mtproxy_base = (
             ConnectionTcpMTProxyRandomizedIntermediate
-            if _mtproxy_secret.lower().startswith("dd")
+            if _mtproxy_secret_for_telethon.lower().startswith("dd")
             else ConnectionTcpMTProxyAbridged
         )
 
@@ -114,7 +182,7 @@ if _mtproxy_config is not None:
                     port,
                     dc_id,
                     loggers=loggers,
-                    proxy=(_mtproxy_host, _mtproxy_port, _mtproxy_secret),
+                    proxy=(_mtproxy_host, _mtproxy_port, _mtproxy_secret_for_telethon),
                     local_addr=local_addr,
                 )
 
