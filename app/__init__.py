@@ -18,16 +18,15 @@ if _requested_dc not in {"", "auto"}:
     os.environ["TELEGRAM_DOWNLOAD_DC"] = "auto"
 
 
-# Transport selection is intentionally centralized here because app.bot imports
-# ConnectionTcpAbridged directly. The historical high-throughput downloader
-# used Telethon's default TCP Full transport, while the later Abridged switch
-# reduced protocol overhead but did not reproduce the historical peak rate on
-# this Windows runner. Keep Full as the production default, while allowing a
-# controlled Abridged fallback through TELEGRAM_DOWNLOAD_TRANSPORT=abridged.
+# The downloader currently imports Telethon's Abridged transport directly.
+# Keep that import stable while allowing transport experiments without
+# rewriting the downloader. The default remains Full because it matches the
+# historical high-throughput implementation. Obfuscated2 is available as a
+# route/traffic-shaping experiment; it does not change the Telegram DC.
 _transport = os.getenv("TELEGRAM_DOWNLOAD_TRANSPORT", "full").strip().lower()
-if _transport not in {"full", "abridged"}:
+if _transport not in {"full", "abridged", "obfuscated2"}:
     raise ValueError(
-        "TELEGRAM_DOWNLOAD_TRANSPORT must be 'full' or 'abridged'"
+        "TELEGRAM_DOWNLOAD_TRANSPORT must be 'full', 'abridged', or 'obfuscated2'"
     )
 
 if _transport == "full":
@@ -35,6 +34,11 @@ if _transport == "full":
     from telethon.network.connection.tcpfull import ConnectionTcpFull
 
     _tcpabridged.ConnectionTcpAbridged = ConnectionTcpFull
+elif _transport == "obfuscated2":
+    import telethon.network.connection.tcpabridged as _tcpabridged
+    from telethon.network.connection.tcpobfuscated2 import ConnectionTcpObfuscated2
+
+    _tcpabridged.ConnectionTcpAbridged = ConnectionTcpObfuscated2
 
 print(
     f"Telegram download transport profile: {_transport}",
