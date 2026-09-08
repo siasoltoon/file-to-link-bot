@@ -284,8 +284,41 @@ async def _download_telegram_file(
                     connection_recoveries[i],
                 )
             )
-            selected = candidates[0]
-            return selected
+            return candidates[0]
+
+    def is_recoverable_download_error(exc: BaseException) -> bool:
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError)):
+            return True
+        if isinstance(exc, ValueError) and "Request was unsuccessful" in str(exc):
+            return True
+        return False
+
+    async def recover_worker(
+        worker_index: int,
+        current_connection: int,
+        offset: int,
+        recoveries: int,
+        reason: BaseException,
+    ) -> tuple[int, int]:
+        if recoveries >= TELEGRAM_DOWNLOAD_MAX_RECOVERIES:
+            raise RuntimeError(
+                f"worker {worker_index + 1} exceeded maximum recovery attempts "
+                f"({TELEGRAM_DOWNLOAD_MAX_RECOVERIES}) at offset {offset}: {reason!r}"
+            ) from reason
+
+        new_connection = await choose_recovery_connection(current_connection)
+        async with stats_lock:
+            worker_connection[worker_index] = new_connection
+            connection_recoveries[current_connection] += 1
+        recoveries += 1
+        print(
+            f"DOWNLOAD CONNECTION RECOVERY: worker={worker_index + 1}/{worker_count} "
+            f"C{current_connection + 1}->C{new_connection + 1} "
+            f"offset={offset} recovery={recoveries} reason={reason!r}",
+            flush=True,
+        )
+        await asyncio.sleep(0.15)
+        return new_connection, recoveries
 
     async def worker(worker_index: int) -> None:
         nonlocal downloaded_total
@@ -343,31 +376,22 @@ async def _download_telegram_file(
                     raise RuntimeError(
                         f"download iterator ended early at offset={offset}"
                     )
-                except asyncio.TimeoutError:
-                    recoveries += 1
-                    if recoveries > TELEGRAM_DOWNLOAD_MAX_RECOVERIES:
-                        raise RuntimeError(
-                            f"worker {worker_index + 1} exceeded maximum recovery attempts "
-                            f"({TELEGRAM_DOWNLOAD_MAX_RECOVERIES}) at offset {offset}"
-                        )
-                    try:
-                        await iterator.close()
-                        iterator_closed = True
-                    except Exception:
-                        pass
-                    new_connection = await choose_recovery_connection(connection_index)
-                    async with stats_lock:
-                        worker_connection[worker_index] = new_connection
-                        connection_recoveries[connection_index] += 1
-                    print(
-                        f"DOWNLOAD CONNECTION RECOVERY: worker={worker_index + 1}/{worker_count} "
-                        f"C{connection_index + 1}->C{new_connection + 1} "
-                        f"offset={offset} recovery={recoveries}",
-                        flush=True,
-                    )
-                    await asyncio.sleep(0.15)
-                    continue
                 except Exception as exc:
+                    if is_recoverable_download_error(exc):
+                        try:
+                            await iterator.close()
+                            iterator_closed = True
+                        except Exception:
+                            pass
+                        connection_index, recoveries = await recover_worker(
+                            worker_index,
+                            connection_index,
+                            offset,
+                            recoveries,
+                            exc,
+                        )
+                        continue
+
                     print(
                         f"DOWNLOAD WORKER ERROR: worker={worker_index + 1}/{worker_count} "
                         f"connection={connection_index + 1}/{connection_count} "
@@ -620,10 +644,14 @@ async def main() -> None:
         await client.run_until_disconnected()
     finally:
         for downloader in download_clients:
-            if downloader.is_connected():
+            try:
                 await downloader.disconnect()
-        if client.is_connected():
+            except Exception:
+                pass
+        try:
             await client.disconnect()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
