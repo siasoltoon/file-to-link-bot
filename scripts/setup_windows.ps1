@@ -49,10 +49,52 @@ function Ensure-ChocoPackage {
     Write-Host "Installed: $DisplayName"
 }
 
+function Find-Executable {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Candidates
+    )
+
+    foreach ($candidate in $Candidates) {
+        if (Test-Path $candidate) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    return $null
+}
+
+function Ensure-DesktopShortcut {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string[]]$ExecutableCandidates
+    )
+
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    if ([string]::IsNullOrWhiteSpace($desktop)) {
+        throw "Could not determine the current user's Desktop path."
+    }
+
+    $shortcutPath = Join-Path $desktop "$Name.lnk"
+    $target = Find-Executable -Candidates $ExecutableCandidates
+
+    if ([string]::IsNullOrWhiteSpace($target)) {
+        Write-Warning "Could not find executable for $Name; shortcut was not created."
+        return
+    }
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $target
+    $shortcut.WorkingDirectory = Split-Path $target -Parent
+    $shortcut.Save()
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
+
+    Write-Host "Desktop shortcut ready: $shortcutPath"
+}
+
 Ensure-Chocolatey
 
 # User applications / utilities for every fresh Windows VPS.
-# Keep this list limited to applications explicitly requested by the user.
 $apps = @(
     @{ Package = "telegram"; DisplayName = "Telegram Desktop" },
     @{ Package = "internet-download-manager"; DisplayName = "Internet Download Manager (IDM)" },
@@ -62,6 +104,19 @@ $apps = @(
 foreach ($app in $apps) {
     Ensure-ChocoPackage -Package $app.Package -DisplayName $app.DisplayName
 }
+
+# Always create the requested shortcuts on the current user's Desktop.
+Ensure-DesktopShortcut -Name "Telegram" -ExecutableCandidates @(
+    "$env:APPDATA\Telegram Desktop\Telegram.exe",
+    "$env:LOCALAPPDATA\Programs\Telegram Desktop\Telegram.exe",
+    "$env:ProgramFiles\Telegram Desktop\Telegram.exe",
+    "${env:ProgramFiles(x86)}\Telegram Desktop\Telegram.exe"
+)
+
+Ensure-DesktopShortcut -Name "Internet Download Manager" -ExecutableCandidates @(
+    "${env:ProgramFiles(x86)}\Internet Download Manager\IDMan.exe",
+    "$env:ProgramFiles\Internet Download Manager\IDMan.exe"
+)
 
 # Tailscale is installed by the RDP workflow itself because it needs the
 # TAILSCALE_AUTHKEY secret and must be authenticated after installation.
