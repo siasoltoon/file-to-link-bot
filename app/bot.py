@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import urlparse
 
 from telethon import TelegramClient, events
 from telethon.errors import MessageNotModifiedError
@@ -30,6 +31,7 @@ TELEGRAM_DOWNLOAD_WORKERS = max(
     1, min(int(os.getenv("TELEGRAM_DOWNLOAD_WORKERS", "32")), 32)
 )
 TELEGRAM_DOWNLOAD_DC = os.getenv("TELEGRAM_DOWNLOAD_DC", "auto").strip().lower()
+TELEGRAM_DOWNLOAD_PROXY_URL = os.getenv("TELEGRAM_DOWNLOAD_PROXY_URL", "").strip()
 TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS = max(
     2.0, float(os.getenv("TELEGRAM_DOWNLOAD_LOG_INTERVAL_SECONDS", "5"))
 )
@@ -48,6 +50,47 @@ TELEGRAM_DOWNLOAD_RECONNECT_TIMEOUT_SECONDS = max(
 TELEGRAM_DOWNLOAD_RECOVERY_COOLDOWN_SECONDS = max(
     0.5, float(os.getenv("TELEGRAM_DOWNLOAD_RECOVERY_COOLDOWN_SECONDS", "3"))
 )
+
+
+def _build_download_proxy():
+    """Parse an optional SOCKS proxy URL for Telegram downloader connections."""
+    if not TELEGRAM_DOWNLOAD_PROXY_URL:
+        print("Telegram downloader proxy: disabled (direct route)", flush=True)
+        return None
+
+    parsed = urlparse(TELEGRAM_DOWNLOAD_PROXY_URL)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"socks5", "socks4", "http"}:
+        raise ValueError(
+            "TELEGRAM_DOWNLOAD_PROXY_URL must use socks5://, socks4://, or http://"
+        )
+    if not parsed.hostname or not parsed.port:
+        raise ValueError(
+            "TELEGRAM_DOWNLOAD_PROXY_URL must include proxy host and port"
+        )
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("TELEGRAM_DOWNLOAD_PROXY_URL must not contain path/query/fragment")
+
+    proxy = {
+        "proxy_type": scheme,
+        "addr": parsed.hostname,
+        "port": parsed.port,
+        "rdns": True,
+    }
+    if parsed.username is not None:
+        proxy["username"] = parsed.username
+    if parsed.password is not None:
+        proxy["password"] = parsed.password
+
+    print(
+        "Telegram downloader proxy: enabled "
+        f"type={scheme} host={parsed.hostname} port={parsed.port} rdns=true",
+        flush=True,
+    )
+    return proxy
+
+
+TELEGRAM_DOWNLOAD_PROXY = _build_download_proxy()
 
 
 class _ProgressReporter:
@@ -207,7 +250,8 @@ async def _download_telegram_file(
         f"DOWNLOAD START: size={file_size} bytes ({_human_size(file_size)}), "
         f"document_dc={document_dc_id}, requested_dc={requested_dc_id}, "
         f"connections={connection_count}, workers={worker_count}, part={part_size} bytes, "
-        f"request_timeout={TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT_SECONDS:.1f}s",
+        f"request_timeout={TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT_SECONDS:.1f}s, "
+        f"proxy={'enabled' if TELEGRAM_DOWNLOAD_PROXY else 'direct'}",
         flush=True,
     )
 
@@ -683,6 +727,7 @@ async def main() -> None:
                 settings.telegram_api_id,
                 settings.telegram_api_hash,
                 connection=ConnectionTcpAbridged,
+                proxy=TELEGRAM_DOWNLOAD_PROXY,
                 receive_updates=False,
                 request_retries=5,
                 connection_retries=5,
@@ -697,7 +742,8 @@ async def main() -> None:
             download_clients.append(downloader)
             print(
                 f"Telegram download connection {index + 1}/{TELEGRAM_DOWNLOAD_CONNECTIONS} ready "
-                f"(dc={downloader.session.dc_id}, transport=abridged)",
+                f"(dc={downloader.session.dc_id}, transport=abridged, "
+                f"route={'proxy' if TELEGRAM_DOWNLOAD_PROXY else 'direct'})",
                 flush=True,
             )
 
@@ -721,7 +767,9 @@ async def main() -> None:
         print(
             f"Telegram downloader: {TELEGRAM_DOWNLOAD_CONNECTIONS} MTProto connections × "
             f"{TELEGRAM_DOWNLOAD_WORKERS} concurrent download workers × "
-            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests × abridged TCP × self-healing × dc={TELEGRAM_DOWNLOAD_DC}",
+            f"{TELEGRAM_DOWNLOAD_PART_SIZE_KB} KiB requests × abridged TCP × "
+            f"route={'proxy' if TELEGRAM_DOWNLOAD_PROXY else 'direct'} × "
+            f"self-healing × dc={TELEGRAM_DOWNLOAD_DC}",
             flush=True,
         )
         await client.run_until_disconnected()
