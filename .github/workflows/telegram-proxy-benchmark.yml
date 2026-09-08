@@ -35,7 +35,6 @@ jobs:
       TELEGRAM_DOWNLOAD_CONNECTIONS: ${{ inputs.connection_count }}
       TELEGRAM_DOWNLOAD_WORKERS: "4"
       TELEGRAM_DOWNLOAD_DC: ${{ inputs.download_dc }}
-      TELEGRAM_DOWNLOAD_PROXY_URL: ${{ secrets.TELEGRAM_DOWNLOAD_PROXY_URL }}
       S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
       S3_REGION: eu-west-1
       S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
@@ -67,12 +66,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:BOT_TOKEN)) { throw "BOT_TOKEN is missing." }
           if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_API_ID)) { throw "TELEGRAM_API_ID is missing." }
           if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_API_HASH)) { throw "TELEGRAM_API_HASH is missing." }
-          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_DOWNLOAD_PROXY_URL)) {
-              Write-Host "ROUTE MODE: direct"
-          } else {
-              Write-Host "ROUTE MODE: proxy"
-              Write-Host "Proxy URL is configured through a GitHub Secret and will not be printed."
-          }
+          Write-Host "ROUTE MODE: direct"
           Write-Host "Connections: $env:TELEGRAM_DOWNLOAD_CONNECTIONS"
           Write-Host "Workers: $env:TELEGRAM_DOWNLOAD_WORKERS"
           Write-Host "Requested DC: $env:TELEGRAM_DOWNLOAD_DC"
