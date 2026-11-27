@@ -17,7 +17,7 @@ from telethon.sessions import MemorySession
 from telethon.tl import types
 
 from .config import settings
-from .db import StoredFile, add_file, utcnow
+from .db import StoredFile, add_file, init_db, utcnow
 from .storage import storage
 
 
@@ -712,6 +712,7 @@ async def _process_media(event, download_clients) -> None:
 
 
 async def main() -> None:
+    init_db()
     storage.healthcheck()
 
     try:
