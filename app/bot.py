@@ -16,6 +16,7 @@ from telethon.sessions import MemorySession
 from telethon.tl import types
 
 from .config import settings
+from .db import StoredFile, add_file, init_db, utcnow
 from .storage import storage
 
 
@@ -579,6 +580,10 @@ async def _process_media(event, download_clients) -> None:
     if not message or not message.media:
         return
 
+    if not settings.public_base_url:
+        await event.reply("⚠️ لینک دائمی هنوز پیکربندی نشده است. مدیر ربات باید PUBLIC_BASE_URL را تنظیم کند.")
+        return
+
     tg_file = message.file
     if tg_file is None:
         return
@@ -650,21 +655,37 @@ async def _process_media(event, download_clients) -> None:
             upload_progress.upload_callback,
         )
 
-        await status.edit("🔗 آپلود کامل شد؛ در حال ساخت لینک دانلود مستقیم...")
-        link = await asyncio.to_thread(
-            storage.presigned_download_url,
-            object_key,
-            filename,
-            None,
-            content_type,
-        )
+        sender_id = int(event.sender_id or 0)
+        created_at = utcnow()
+        try:
+            await asyncio.to_thread(
+                add_file,
+                StoredFile(
+                    link_token=token,
+                    owner_telegram_id=sender_id,
+                    filename=filename,
+                    content_type=content_type,
+                    size_bytes=actual_size,
+                    object_key=object_key,
+                    created_at=created_at,
+                    expires_at=None,
+                ),
+            )
+        except Exception:
+            # Do not leave an untracked object behind if metadata persistence fails.
+            await asyncio.to_thread(storage.delete_file, object_key)
+            raise
+
+        link = f"{settings.public_base_url.rstrip('/')}/d/{token}"
+        link_kind = "لینک ثابت و بدون انقضا"
 
         await status.edit(
-            "✅ لینک دانلود مستقیم آماده شد!\n\n"
+            "✅ آپلود کامل شد و لینک آماده است!\n\n"
             f"📁 {filename}\n"
             f"💾 {_human_size(actual_size)}\n"
-            f"⏳ اعتبار لینک: {settings.direct_link_expires_seconds // 86400} روز\n\n"
-            f"🔗 {link}"
+            "⏳ اعتبار لینک و نگهداری فایل: بدون انقضا\n"
+            f"🔗 نوع لینک: {link_kind}\n\n"
+            f"🌐 {link}"
         )
     except Exception as exc:
         print(f"file processing error: {exc!r}", flush=True)
@@ -686,6 +707,7 @@ async def _process_media(event, download_clients) -> None:
 
 
 async def main() -> None:
+    init_db()
     storage.healthcheck()
 
     try:

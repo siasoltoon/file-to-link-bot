@@ -10,7 +10,7 @@ from .config import settings
 
 class Storage:
     def __init__(self) -> None:
-        # Keep Fil.one client settings aligned with the already-working YouTube bot.
+        # Fil.one requires path-style addressing and AWS Signature Version 4.
         self.client = boto3.client(
             "s3",
             endpoint_url=settings.s3_endpoint_url,
@@ -19,6 +19,7 @@ class Storage:
             aws_secret_access_key=settings.s3_secret_access_key,
             config=Config(
                 signature_version="s3v4",
+                s3={"addressing_style": "path"},
                 retries={"max_attempts": 8, "mode": "standard"},
             ),
         )

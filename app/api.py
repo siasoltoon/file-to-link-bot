@@ -45,10 +45,9 @@ async def download(token: str):
         raise HTTPException(status_code=404, detail="File not found")
 
     if row.expires_at is not None and row.expires_at <= utcnow():
-        try:
-            await asyncio.to_thread(storage.delete_file, row.object_key)
-        finally:
-            delete_record(row.id)
+        # Keep metadata if object deletion fails so the cleanup worker can retry.
+        await asyncio.to_thread(storage.delete_file, row.object_key)
+        delete_record(row.id)
         raise HTTPException(status_code=410, detail="Link expired")
 
     url = await asyncio.to_thread(storage.presigned_download_url, row.object_key, row.filename, 300)
