@@ -688,7 +688,7 @@ async def _process_media(event, download_clients) -> None:
             "✅ آپلود کامل شد و لینک آماده است!\n\n"
             f"📁 {filename}\n"
             f"💾 {_human_size(actual_size)}\n"
-            f"⏳ مهلت نگهداری فایل: {'بدون انقضا' if expires_at is None else settings.default_file_ttl_days + ' روز'}\n"
+            f"⏳ مهلت نگهداری فایل: {'بدون انقضا' if expires_at is None else str(settings.default_file_ttl_days) + ' روز'}\n"
             f"🔗 نوع لینک: {link_kind}\n\n"
             f"🌐 {link}"
         )
