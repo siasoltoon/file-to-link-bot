@@ -7,7 +7,6 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from datetime import timedelta
 from urllib.parse import urlparse
 
 from telethon import TelegramClient, events
@@ -653,9 +652,7 @@ async def _process_media(event, download_clients) -> None:
         )
 
         sender_id = int(event.sender_id or 0)
-        is_owner = settings.owner_telegram_id is not None and sender_id == settings.owner_telegram_id
         created_at = utcnow()
-        expires_at = None if is_owner else created_at + timedelta(days=settings.default_file_ttl_days)
         try:
             await asyncio.to_thread(
                 add_file,
@@ -667,7 +664,7 @@ async def _process_media(event, download_clients) -> None:
                     size_bytes=actual_size,
                     object_key=object_key,
                     created_at=created_at,
-                    expires_at=expires_at,
+                    expires_at=None,
                 ),
             )
         except Exception:
@@ -693,7 +690,7 @@ async def _process_media(event, download_clients) -> None:
             "✅ آپلود کامل شد و لینک آماده است!\n\n"
             f"📁 {filename}\n"
             f"💾 {_human_size(actual_size)}\n"
-            f"⏳ مهلت نگهداری فایل: {'بدون انقضا' if expires_at is None else str(settings.default_file_ttl_days) + ' روز'}\n"
+            "⏳ اعتبار لینک و نگهداری فایل: بدون انقضا\n"
             f"🔗 نوع لینک: {link_kind}\n\n"
             f"🌐 {link}"
         )
