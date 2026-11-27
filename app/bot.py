@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from datetime import timedelta
 from urllib.parse import urlparse
 
 from telethon import TelegramClient, events
@@ -16,6 +17,7 @@ from telethon.sessions import MemorySession
 from telethon.tl import types
 
 from .config import settings
+from .db import StoredFile, add_file, utcnow
 from .storage import storage
 
 
@@ -650,21 +652,45 @@ async def _process_media(event, download_clients) -> None:
             upload_progress.upload_callback,
         )
 
-        await status.edit("🔗 آپلود کامل شد؛ در حال ساخت لینک دانلود مستقیم...")
-        link = await asyncio.to_thread(
-            storage.presigned_download_url,
-            object_key,
-            filename,
-            None,
-            content_type,
+        sender_id = int(event.sender_id or 0)
+        is_owner = settings.owner_telegram_id is not None and sender_id == settings.owner_telegram_id
+        created_at = utcnow()
+        expires_at = None if is_owner else created_at + timedelta(days=settings.default_file_ttl_days)
+        await asyncio.to_thread(
+            add_file,
+            StoredFile(
+                link_token=token,
+                owner_telegram_id=sender_id,
+                filename=filename,
+                content_type=content_type,
+                size_bytes=actual_size,
+                object_key=object_key,
+                created_at=created_at,
+                expires_at=expires_at,
+            ),
         )
 
+        if settings.public_base_url:
+            link = f"{settings.public_base_url.rstrip('/')}/d/{token}"
+            link_kind = "لینک ثابت"
+        else:
+            # Allows local testing before a public HTTPS domain is configured.
+            link = await asyncio.to_thread(
+                storage.presigned_download_url,
+                object_key,
+                filename,
+                None,
+                content_type,
+            )
+            link_kind = f"لینک مستقیم موقت ({settings.direct_link_expires_seconds // 86400} روز)"
+
         await status.edit(
-            "✅ لینک دانلود مستقیم آماده شد!\n\n"
+            "✅ آپلود کامل شد و لینک آماده است!\n\n"
             f"📁 {filename}\n"
             f"💾 {_human_size(actual_size)}\n"
-            f"⏳ اعتبار لینک: {settings.direct_link_expires_seconds // 86400} روز\n\n"
-            f"🔗 {link}"
+            f"⏳ مهلت نگهداری فایل: {'بدون انقضا' if expires_at is None else settings.default_file_ttl_days + ' روز'}\n"
+            f"🔗 نوع لینک: {link_kind}\n\n"
+            f"🌐 {link}"
         )
     except Exception as exc:
         print(f"file processing error: {exc!r}", flush=True)
