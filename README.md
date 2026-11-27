@@ -15,7 +15,7 @@ Telegram's Local Bot API supports unlimited file downloads and uploads up to 200
 ## Link policy
 
 - **Owner (configured by `OWNER_TELEGRAM_ID`)**: stable link with no expiration and unlimited downloads.
-- **Other users**: unlimited downloads, but the file and link are automatically deleted after `DEFAULT_FILE_TTL_DAYS`.
+- **Other users**: unlimited downloads, but the file and link are automatically deleted after `DEFAULT_FILE_TTL_DAYS` (30 days by default).
 - No download-count limits.
 
 ## Architecture
@@ -50,8 +50,8 @@ This repository currently contains the initial production-oriented scaffold. Sec
 2. Install Docker and Docker Compose.
 3. Obtain Telegram `api_id` and `api_hash` from `my.telegram.org`.
 4. Create the Telegram bot with BotFather and obtain its token.
-5. Create a Fil One bucket and S3 credentials.
-6. Fill `.env` from `.env.example`.
+5. Create a Fil One bucket and an API key in the **same region** as that bucket. The default configuration is `eu-west-1` (France); set `S3_REGION=us-east-1` only if your bucket and API key were created in US East (Michigan). The endpoint is derived automatically from this value. Fil.one requires S3 path-style addressing and Signature Version 4.
+6. Fill `.env` from `.env.example`, including `S3_BUCKET`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY`. Set `PUBLIC_BASE_URL` to the public HTTPS base URL of this app (for example, `https://files.example.com`) to send stable `/d/<token>` links. If it is blank, the bot falls back to temporary presigned storage URLs.
 7. Start the Local Bot API and application with Docker Compose.
 8. Before switching an existing bot from Telegram's hosted Bot API, call `logOut` on the old Bot API session as required by Telegram's Local Bot API documentation.
 
@@ -62,4 +62,4 @@ This repository currently contains the initial production-oriented scaffold. Sec
 - Use a reverse proxy with TLS in production.
 - Generate cryptographically random public link tokens.
 - Validate expiry before generating any storage URL.
-- Delete expired objects from Fil One and their metadata from the database.
+- Delete expired objects from Fil One and their metadata from the database. Fil.one lifecycle expiration is not used; the application cleanup worker performs deletion.
