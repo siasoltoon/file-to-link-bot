@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     s3_bucket: str
 
     direct_link_expires_seconds: int = 604800
+    default_file_ttl_days: int = 30
     max_file_bytes: int = 2_000_000_000
     database_url: str = "sqlite:///./data/app.db"
     app_host: str = "0.0.0.0"
