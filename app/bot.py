@@ -656,19 +656,24 @@ async def _process_media(event, download_clients) -> None:
         is_owner = settings.owner_telegram_id is not None and sender_id == settings.owner_telegram_id
         created_at = utcnow()
         expires_at = None if is_owner else created_at + timedelta(days=settings.default_file_ttl_days)
-        await asyncio.to_thread(
-            add_file,
-            StoredFile(
-                link_token=token,
-                owner_telegram_id=sender_id,
-                filename=filename,
-                content_type=content_type,
-                size_bytes=actual_size,
-                object_key=object_key,
-                created_at=created_at,
-                expires_at=expires_at,
-            ),
-        )
+        try:
+            await asyncio.to_thread(
+                add_file,
+                StoredFile(
+                    link_token=token,
+                    owner_telegram_id=sender_id,
+                    filename=filename,
+                    content_type=content_type,
+                    size_bytes=actual_size,
+                    object_key=object_key,
+                    created_at=created_at,
+                    expires_at=expires_at,
+                ),
+            )
+        except Exception:
+            # Do not leave an untracked object behind if metadata persistence fails.
+            await asyncio.to_thread(storage.delete_file, object_key)
+            raise
 
         if settings.public_base_url:
             link = f"{settings.public_base_url.rstrip('/')}/d/{token}"
