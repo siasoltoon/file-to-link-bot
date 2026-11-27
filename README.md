@@ -14,8 +14,7 @@ Telegram's Local Bot API supports unlimited file downloads and uploads up to 200
 
 ## Link policy
 
-- **Owner (configured by `OWNER_TELEGRAM_ID`)**: stable link with no expiration and unlimited downloads.
-- **Other users**: unlimited downloads, but the file and link are automatically deleted after `DEFAULT_FILE_TTL_DAYS` (30 days by default).
+- **All users**: stable links with no expiration and unlimited downloads. Files are retained until manually deleted; no automatic TTL cleanup is applied.
 - No download-count limits.
 
 ## Architecture
@@ -51,7 +50,7 @@ This repository currently contains the initial production-oriented scaffold. Sec
 3. Obtain Telegram `api_id` and `api_hash` from `my.telegram.org`.
 4. Create the Telegram bot with BotFather and obtain its token.
 5. Create a Fil One bucket and an API key in the **same region** as that bucket. The default configuration is `eu-west-1` (France); set `S3_REGION=us-east-1` only if your bucket and API key were created in US East (Michigan). The endpoint is derived automatically from this value. Fil.one requires S3 path-style addressing and Signature Version 4.
-6. Fill `.env` from `.env.example`, including `S3_BUCKET`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY`. Set `PUBLIC_BASE_URL` to the public HTTPS base URL of this app (for example, `https://files.example.com`) to send stable `/d/<token>` links. If it is blank, the bot falls back to temporary presigned storage URLs.
+6. Fill `.env` from `.env.example`, including `S3_BUCKET`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY`. Set `PUBLIC_BASE_URL` to the public HTTPS base URL of this app (for example, `https://files.example.com`) to send stable `/d/<token>` links. This setting is required for the permanent-link behavior; without it, the bot falls back to a temporary Fil.one URL.
 7. Start the Local Bot API and application with Docker Compose.
 8. Before switching an existing bot from Telegram's hosted Bot API, call `logOut` on the old Bot API session as required by Telegram's Local Bot API documentation.
 
@@ -61,5 +60,5 @@ This repository currently contains the initial production-oriented scaffold. Sec
 - Keep the Telegram Local Bot API port private; expose only the application/download API through HTTPS.
 - Use a reverse proxy with TLS in production.
 - Generate cryptographically random public link tokens.
-- Validate expiry before generating any storage URL.
-- Delete expired objects from Fil One and their metadata from the database. Fil.one lifecycle expiration is not used; the application cleanup worker performs deletion.
+- Link tokens do not expire. Each visit generates a fresh short-lived Fil.one download URL and redirects to it, so the temporary storage URL is never the permanent public link.
+- Files are not automatically deleted. Add a manual deletion/admin workflow before enabling any retention policy.
