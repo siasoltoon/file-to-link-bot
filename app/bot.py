@@ -580,6 +580,10 @@ async def _process_media(event, download_clients) -> None:
     if not message or not message.media:
         return
 
+    if not settings.public_base_url:
+        await event.reply("⚠️ لینک دائمی هنوز پیکربندی نشده است. مدیر ربات باید PUBLIC_BASE_URL را تنظیم کند.")
+        return
+
     tg_file = message.file
     if tg_file is None:
         return
@@ -672,19 +676,8 @@ async def _process_media(event, download_clients) -> None:
             await asyncio.to_thread(storage.delete_file, object_key)
             raise
 
-        if settings.public_base_url:
-            link = f"{settings.public_base_url.rstrip('/')}/d/{token}"
-            link_kind = "لینک ثابت"
-        else:
-            # Allows local testing before a public HTTPS domain is configured.
-            link = await asyncio.to_thread(
-                storage.presigned_download_url,
-                object_key,
-                filename,
-                None,
-                content_type,
-            )
-            link_kind = f"لینک مستقیم موقت ({settings.direct_link_expires_seconds // 86400} روز)"
+        link = f"{settings.public_base_url.rstrip('/')}/d/{token}"
+        link_kind = "لینک ثابت و بدون انقضا"
 
         await status.edit(
             "✅ آپلود کامل شد و لینک آماده است!\n\n"
