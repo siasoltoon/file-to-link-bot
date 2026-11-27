@@ -10,7 +10,7 @@ from .config import settings
 
 class Storage:
     def __init__(self) -> None:
-        # Keep Fil.one client settings aligned with the already-working YouTube bot.
+        # Fil.one requires path-style addressing and AWS Signature Version 4.
         self.client = boto3.client(
             "s3",
             endpoint_url=settings.s3_endpoint_url,
@@ -19,6 +19,7 @@ class Storage:
             aws_secret_access_key=settings.s3_secret_access_key,
             config=Config(
                 signature_version="s3v4",
+                s3={"addressing_style": "path"},
                 retries={"max_attempts": 8, "mode": "standard"},
             ),
         )
@@ -43,8 +44,8 @@ class Storage:
         filename = (
             Path(local_path)
             .name.replace('"', "")
-            .replace("\r", "")
-            .replace("\n", "")
+            .replace("\\r", "")
+            .replace("\\n", "")
         )
         extra_args = {
             "ContentType": content_type or "application/octet-stream",
@@ -74,7 +75,7 @@ class Storage:
 
         # Override the download response headers on the signed GET so the browser
         # uses the original Telegram filename instead of an S3/object-key name.
-        safe_filename = filename.replace("\r", "").replace("\n", "").replace('"', "")
+        safe_filename = filename.replace("\\r", "").replace("\\n", "").replace('"', "")
         ascii_fallback = Path(safe_filename).name.encode("ascii", "ignore").decode("ascii").strip()
         ascii_fallback = ascii_fallback or "download"
         encoded_filename = quote(safe_filename, safe="")
